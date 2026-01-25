@@ -6,6 +6,7 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+from typing import Optional  # <-- FIX
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -40,16 +41,13 @@ def open_in_file_manager(path: Path):
             subprocess.run(["xdg-open", p], check=False)
     except Exception:
         # fallback: abrir carpeta contenedora
-        try:
-            parent = str(path if path.is_dir() else path.parent)
-            if sys.platform.startswith("win"):
-                os.startfile(parent)  # noqa
-            elif sys.platform == "darwin":
-                subprocess.run(["open", parent], check=False)
-            else:
-                subprocess.run(["xdg-open", parent], check=False)
-        except Exception as e:
-            raise e
+        parent = str(path if path.is_dir() else path.parent)
+        if sys.platform.startswith("win"):
+            os.startfile(parent)  # noqa
+        elif sys.platform == "darwin":
+            subprocess.run(["open", parent], check=False)
+        else:
+            subprocess.run(["xdg-open", parent], check=False)
 
 
 class App(tk.Tk):
@@ -284,9 +282,7 @@ class App(tk.Tk):
         )
         if p:
             self.diag_wav.set(p)
-            # sugerir output
-            pp = Path(p)
-            suggested = pp.with_suffix(".descriptor.json")
+            suggested = Path(p).with_suffix(".descriptor.json")
             self.diag_out.set(str(suggested))
 
     def _pick_diag_out(self):
@@ -302,7 +298,6 @@ class App(tk.Tk):
         p = filedialog.askdirectory(title="Elige carpeta DB (con _INDEX.json)")
         if p:
             self.match_db.set(p)
-            # sugerir output
             suggested = Path(p) / "match_report.json"
             self.match_out.set(str(suggested))
 
@@ -313,10 +308,6 @@ class App(tk.Tk):
         )
         if p:
             self.match_target.set(p)
-            # sugerir output si no hay
-            if not self.match_out.get().strip() and self.match_db.get().strip():
-                suggested = Path(self.match_db.get().strip()) / "match_report.json"
-                self.match_out.set(str(suggested))
 
     def _pick_match_out(self):
         p = filedialog.asksaveasfilename(
@@ -331,13 +322,13 @@ class App(tk.Tk):
 
     def _current_output_path(self) -> Optional[Path]:
         tab = self.nb.index("current")
-        if tab == 0:  # index
+        if tab == 0:
             p = self.out_dir.get().strip()
             return Path(p) if p else None
-        if tab == 1:  # diag
+        if tab == 1:
             p = self.diag_out.get().strip()
             return Path(p) if p else None
-        if tab == 2:  # match
+        if tab == 2:
             p = self.match_out.get().strip()
             return Path(p) if p else None
         return None
@@ -347,7 +338,6 @@ class App(tk.Tk):
         if not p:
             return
         try:
-            # si es archivo, abre carpeta; si es dir, abre dir
             if p.suffix.lower() in (".json", ".txt", ".wav"):
                 open_in_file_manager(p.parent)
             else:
@@ -360,7 +350,6 @@ class App(tk.Tk):
         self.btn_run_index.config(state=state)
         self.btn_run_diag.config(state=state)
         self.btn_run_match.config(state=state)
-        self.nb.enable_traversal()
         if running:
             self.progress.start(12)
         else:
@@ -545,3 +534,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
