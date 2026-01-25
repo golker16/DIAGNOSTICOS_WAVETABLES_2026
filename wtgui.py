@@ -225,6 +225,7 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=0.2, to=6.0, increment=0.1, textvariable=self.match_eq_smooth, width=10)\
             .grid(row=0, column=5, padx=6)
 
+        # Label CONSISTENTE con el motor/CLI:
         ttk.Checkbutton(opts, text="Include samples (type=sample)", variable=self.match_include_samples)\
             .grid(row=0, column=6, padx=10, sticky="w")
 
@@ -391,6 +392,8 @@ class App(tk.Tk):
                 table_size = int(ts)
                 harmonics = int(harm)
                 bands = int(bands)
+                # Nota: no exponemos include_samples en UI Index (por defecto False).
+                # cmd_index usa getattr(..., False), así que está OK.
 
             rc = wtdiag.cmd_index(Args())
             if rc == 0:
