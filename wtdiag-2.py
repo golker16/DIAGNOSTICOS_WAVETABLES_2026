@@ -49,10 +49,22 @@ def cmd_index(args) -> int:
         print(f"[index] No se encontraron .wav en: {in_dir}")
         return 2
 
+    include_samples = bool(getattr(args, "include_samples", False))
+
     db_entries: List[Dict[str, Any]] = []
+    kept = 0
+    skipped_samples = 0
+
     for i, p in enumerate(wavs, 1):
         try:
             desc = core.process_wavetable(p, args.table_size, args.harmonics, args.bands)
+
+            # NUEVO: evitar “contaminar” la DB con archivos no-wavetable
+            # type="sample" (antes era unknown)
+            if desc.type == "sample" and not include_samples:
+                skipped_samples += 1
+                continue
+
             rel = p.relative_to(in_dir).as_posix()
             safe = rel.replace("/", "__").replace("\\", "__")
             out_json = out_dir / (Path(safe).with_suffix(".json").name)
@@ -67,9 +79,10 @@ def cmd_index(args) -> int:
                 "family": desc.diagnosis.family,
                 "best_for": desc.diagnosis.best_for
             })
+            kept += 1
 
             if i % 50 == 0:
-                print(f"[index] {i}/{len(wavs)} ...")
+                print(f"[index] {i}/{len(wavs)} ... (kept={kept}, skipped_samples={skipped_samples})")
         except Exception as e:
             print(f"[index] ERROR en {p}: {e}")
 
@@ -78,13 +91,18 @@ def cmd_index(args) -> int:
         "harmonics": int(args.harmonics),
         "bands": int(args.bands),
         "count": len(db_entries),
+        "skipped_samples": int(skipped_samples),
+        "include_samples": bool(include_samples),
         "entries": db_entries
     }
 
     with open(out_dir / "_INDEX.json", "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
 
-    print(f"[index] OK. Descriptores: {len(db_entries)} en {out_dir}")
+    msg = f"[index] OK. Descriptores: {len(db_entries)} en {out_dir}"
+    if skipped_samples and not include_samples:
+        msg += f" (skipped_samples={skipped_samples})"
+    print(msg)
     return 0
 
 
@@ -114,6 +132,7 @@ def cmd_diag(args) -> int:
 
 def _get_arg(args, name: str, default):
     return getattr(args, name, default)
+
 
 def cmd_match(args) -> int:
     db_dir = Path(_get_arg(args, "db_dir", _get_arg(args, "db", "")))
@@ -150,7 +169,7 @@ def cmd_match(args) -> int:
 
     topk = int(_get_arg(args, "topk", 50))
     topn = int(_get_arg(args, "topn", 10))
-    include_unknown = bool(_get_arg(args, "include_samples", False))
+    include_samples = bool(_get_arg(args, "include_samples", False))
     gain_mode = str(_get_arg(args, "gain_mode", "rms")).lower()
     gain_mode = "lufs" if gain_mode == "lufs" else "rms"
 
@@ -163,7 +182,8 @@ def cmd_match(args) -> int:
         except Exception:
             continue
 
-        if desc.get("type") == "unknown" and not include_unknown:
+        # NUEVO: el tipo “no wavetable” ahora es sample
+        if desc.get("type") == "sample" and not include_samples:
             continue
 
         try:
@@ -258,7 +278,8 @@ def cmd_match(args) -> int:
             "eq_limit_db": eq_limit_db,
             "eq_smooth": eq_smooth,
             "max_filters": max_filters,
-            "min_sep_bands": min_sep_bands
+            "min_sep_bands": min_sep_bands,
+            "include_samples": bool(include_samples),
         },
         "suggestions": suggestions,
         "matches": results
@@ -268,12 +289,14 @@ def cmd_match(args) -> int:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
+    # TXT legible
     txt_path = out_path.with_suffix(".txt")
     lines: List[str] = []
     lines.append("WAVETABLE MATCH REPORT")
     lines.append(f"Target: {report['target']}")
     lines.append(f"Gain mode: {'lufs' if gain_mode=='lufs' else 'rms_dbfs'}")
     lines.append("")
+
     if suggestions:
         lines.append("SUGERENCIAS:")
         for s in suggestions:
@@ -285,10 +308,21 @@ def cmd_match(args) -> int:
         lines.append(f"   {m['path']}  [{m.get('type')}/{m.get('family')}] best_for={m.get('best_for')}")
         gm = m["gain_match"]
         lines.append(f"   gainMatch({gm['mode']}): target={gm['target']:.2f} cand={gm['candidate']:.2f} delta={gm['gain_delta_db']:.2f} dB")
+
         if m.get("peq_filters"):
             lines.append("   PEQ:")
             for flt in m["peq_filters"]:
-                lines.append(f"     - peaking f0={flt['f0_hz']:.1f}Hz gain={flt['gain_db']:.2f}dB Q={flt['q']:.2f}")
+                ftype = flt.get("type", "peaking")
+                f0 = float(flt.get("f0_hz", 0.0))
+                gain = float(flt.get("gain_db", 0.0))
+
+                # Compatible con shelves (no siempre tienen Q)
+                if ftype in ("low_shelf", "high_shelf"):
+                    slope = float(flt.get("slope", 1.0))
+                    lines.append(f"     - {ftype} f0={f0:.1f}Hz gain={gain:.2f}dB slope={slope:.2f}")
+                else:
+                    q = float(flt.get("q", 1.2))
+                    lines.append(f"     - peaking f0={f0:.1f}Hz gain={gain:.2f}dB Q={q:.2f}")
         lines.append("")
 
     with open(txt_path, "w", encoding="utf-8") as f:
@@ -312,6 +346,14 @@ def main():
     p_index.add_argument("--table-size", type=int, default=2048)
     p_index.add_argument("--harmonics", type=int, default=64)
     p_index.add_argument("--bands", type=int, default=128)
+
+    # NUEVO: evitar contaminar DB (por defecto NO indexa type='sample')
+    p_index.add_argument(
+        "--include-samples",
+        action="store_true",
+        help="Incluye type='sample' (archivos no-wavetable)"
+    )
+
     p_index.set_defaults(func=cmd_index)
 
     p_diag = sub.add_parser("diag", help="Diagnostica 1 wavetable y genera descriptor JSON")
@@ -333,7 +375,10 @@ def main():
     p_match.add_argument("--topn", type=int, default=10)
     p_match.add_argument("--eq-limit-db", type=float, default=6.0)
     p_match.add_argument("--eq-smooth", type=float, default=1.5)
-    p_match.add_argument("--include-samples", action="store_true", help="Incluye type='unknown'")
+
+    # Ajustado: ahora realmente es sample (no unknown)
+    p_match.add_argument("--include-samples", action="store_true", help="Incluye type='sample'")
+
     p_match.add_argument("--gain-mode", choices=["rms", "lufs"], default="rms")
     p_match.add_argument("--max-filters", type=int, default=6)
     p_match.add_argument("--min-sep-bands", type=int, default=6)
@@ -347,5 +392,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
