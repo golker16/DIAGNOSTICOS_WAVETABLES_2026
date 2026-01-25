@@ -33,6 +33,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+          # (opcional pero útil para diagnosticar)
+          python -c "import numpy, scipy, soundfile; print('numpy', numpy.__version__); print('scipy', scipy.__version__); print('soundfile', soundfile.__version__)"
+
       - name: Validate entrypoint files
         shell: pwsh
         run: |
@@ -55,6 +58,9 @@ jobs:
             --hidden-import "json.decoder" `
             --hidden-import "json.scanner" `
             --hidden-import "simplejson" `
+            --collect-all "numpy" `
+            --collect-all "scipy" `
+            --collect-all "soundfile" `
             --add-data "wtdiag-1.py;." `
             --add-data "wtdiag-2.py;." `
             --add-data "wtdiag.py;." `
