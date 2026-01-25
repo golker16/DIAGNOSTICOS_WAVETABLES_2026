@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import find_peaks, get_window, lfilter, resample_poly
+from scipy.signal import find_peaks, get_window, lfilter, resample_poly, peak_widths
 
 # ----------------------------
 # Parámetros estándar offline
@@ -220,12 +220,12 @@ class WTDescriptor:
     diagnosis: WTDiagnosis
 
 # ----------------------------
-# Detección de layout (single vs multi vs unknown) — FIX BUG DIVISORES
+# Detección de layout (single vs multi vs sample) — FIX BUG DIVISORES
 # ----------------------------
 
 def infer_layout(n_samples: int, preferred_table: int) -> Tuple[str, int, int]:
     """
-    type: "single_cycle" | "multi_frame" | "unknown"
+    type: "single_cycle" | "multi_frame" | "sample"
     Corrige el bug: si hay múltiples divisores, elige el ts más cercano a preferred_table
     y con numFrames razonable.
     """
@@ -262,7 +262,8 @@ def infer_layout(n_samples: int, preferred_table: int) -> Tuple[str, int, int]:
         _, ts, nf = candidates[0]
         return "multi_frame", int(ts), int(nf)
 
-    return "unknown", preferred_table, 1
+    # Antes: "unknown"
+    return "sample", preferred_table, 1
 
 # ----------------------------
 # DSP features (ADN, envelope, tono/ruido, LUFS)
@@ -664,10 +665,14 @@ def descriptor_to_spec(desc: WTDescriptor) -> Dict[str, Any]:
     feat = desc.features_mean
     spec: Dict[str, Any] = {
         "path": desc.path,
-        "type": desc.type,  # single_cycle | multi_frame | unknown
+        "type": desc.type,  # single_cycle | multi_frame | sample
         "tableSize": desc.tableSize,
         "numFrames": desc.numFrames,
         "sampleRate": desc.sampleRate,
+
+        # NUEVO: auditable (el SR canónico con el que se mapearon bandas/LUFS)
+        "feature_sr": FEATURE_SR,
+
         "features": {
             "harmonics_64": feat.harmonics,
             "spectral_env_db_128": feat.spectral_env_db,
@@ -750,6 +755,8 @@ def process_wavetable(path: Path, table_size: int, n_harm: int, n_bands: int) ->
         frames = np.stack([standardize_frame(raw_frames[i], table_size, loop_fix=True) for i in range(num_frames)], axis=0)
 
     else:
+        # type="sample": se sigue extrayendo features (útil para diagnosticar),
+        # pero el index/match deberían decidir si incluirlo o no.
         frame = standardize_frame(x[:min(len(x), table_size)], table_size, loop_fix=True)
         frames = frame.reshape(1, -1)
         num_frames = 1
@@ -783,25 +790,143 @@ def smooth_and_limit_delta(delta_db: np.ndarray, limit_db: float, smooth_sigma: 
     d = gaussian_filter1d(delta_db, sigma=smooth_sigma)
     return np.clip(d, -limit_db, limit_db)
 
+def _interp_center_freq(centers: np.ndarray, x: float) -> float:
+    # Interp simple index-fraccional -> Hz usando centers
+    idx = np.arange(len(centers), dtype=np.float32)
+    return float(np.interp(np.float32(x), idx, centers.astype(np.float32)))
+
 def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_bands: int = 6) -> List[Dict[str, float]]:
-    n = len(delta_db)
+    """
+    Convierte delta_env_db (en bandas log) a una lista de filtros paramétricos aproximados:
+      - low_shelf / high_shelf (para "tilt" global)
+      - peaking con Q variable (según ancho del pico/valle)
+
+    Heurística (sin optimización pesada):
+      1) Ajuste lineal de delta vs log(f) => tilt global
+      2) Si tilt es fuerte, lo capturamos con 1 shelf
+      3) Residual => picos/valles => peaking con Q estimado por peak_widths
+    """
+    d = np.array(delta_db, dtype=np.float32)
+    n = len(d)
+    if n < 8 or max_filters <= 0:
+        return []
+
     centers = bands_centers_hz(sr, n)
-    idx_sorted = np.argsort(np.abs(delta_db))[::-1]
+    logf = np.log10(np.maximum(centers, 1.0)).astype(np.float32)
 
-    chosen: List[int] = []
-    for idx in idx_sorted:
-        if len(chosen) >= max_filters:
+    filters: List[Dict[str, float]] = []
+
+    # 1) Tilt global: fit delta ~ a*logf + b
+    a, b = np.polyfit(logf, d.astype(np.float64), 1)
+    a = float(a)
+    b = float(b)
+
+    pred = (a * logf + b).astype(np.float32)
+    tilt_gain = float(pred[-1] - pred[0])  # dB high - low (aprox)
+
+    # Umbral: si el tilt a lo largo del rango es significativo, usamos un shelf
+    # (ajusta este valor si quieres más/menos agresivo)
+    TILT_THR_DB = 3.0
+
+    residual = d.copy()
+
+    if abs(tilt_gain) >= TILT_THR_DB and max_filters >= 1:
+        # Corner heurístico: banda ~40% o ~60% según tipo
+        if tilt_gain > 0:
+            f0 = float(centers[int(np.clip(int(0.60 * (n - 1)), 0, n - 1))])
+            filters.append({
+                "type": "high_shelf",
+                "f0_hz": f0,
+                "gain_db": float(tilt_gain),
+                "slope": 1.0,
+            })
+        else:
+            f0 = float(centers[int(np.clip(int(0.40 * (n - 1)), 0, n - 1))])
+            filters.append({
+                "type": "low_shelf",
+                "f0_hz": f0,
+                "gain_db": float(abs(tilt_gain)),
+                "slope": 1.0,
+            })
+
+        # Removemos el tilt modelado (aprox)
+        residual = (d - pred).astype(np.float32)
+
+    remaining = max(0, max_filters - len(filters))
+    if remaining <= 0:
+        return filters
+
+    # 2) Picos y valles en residual
+    # Reglas: distancia mínima por banda + mínima ganancia para no meter filtros por ruido
+    MIN_PROM_DB = 1.0
+    MIN_GAIN_DB = 0.8
+
+    # Peaks (positivos)
+    peaks, props_p = find_peaks(residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
+    # Valleys (negativos) => peaks sobre -residual
+    valleys, props_v = find_peaks(-residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
+
+    candidates: List[Tuple[float, int, str, float]] = []
+    for i, p in enumerate(peaks):
+        prom = float(props_p["prominences"][i]) if "prominences" in props_p else float(abs(residual[p]))
+        gain = float(residual[p])
+        candidates.append((abs(gain) + 0.25 * prom, int(p), "peaking", gain))
+
+    for i, v in enumerate(valleys):
+        prom = float(props_v["prominences"][i]) if "prominences" in props_v else float(abs(residual[v]))
+        gain = float(residual[v])  # negativo
+        candidates.append((abs(gain) + 0.25 * prom, int(v), "peaking", gain))
+
+    # Orden por "importancia"
+    candidates.sort(key=lambda t: t[0], reverse=True)
+
+    chosen_idx: List[int] = []
+    for _score, idx, _typ, gain in candidates:
+        if len(chosen_idx) >= remaining:
             break
-        if any(abs(int(idx) - c) < min_sep_bands for c in chosen):
+        if abs(gain) < MIN_GAIN_DB:
             continue
-        chosen.append(int(idx))
+        if any(abs(idx - c) < min_sep_bands for c in chosen_idx):
+            continue
+        chosen_idx.append(idx)
 
-    return [{
-        "type": "peaking",
-        "f0_hz": float(centers[idx]),
-        "gain_db": float(delta_db[idx]),
-        "q": 1.2
-    } for idx in chosen]
+    if not chosen_idx:
+        return filters
+
+    # 3) Estimar Q variable con peak_widths
+    # peak_widths requiere peaks sobre una señal positiva;
+    # para valles usamos -residual para medir width igualmente.
+    for idx in chosen_idx:
+        gain = float(residual[idx])
+        if abs(gain) < MIN_GAIN_DB:
+            continue
+
+        if gain >= 0:
+            w_res = peak_widths(residual, peaks=np.array([idx]), rel_height=0.5)
+        else:
+            w_res = peak_widths(-residual, peaks=np.array([idx]), rel_height=0.5)
+
+        left_ip = float(w_res[2][0])  # left_ips
+        right_ip = float(w_res[3][0]) # right_ips
+
+        f0 = float(centers[idx])
+        f_left = _interp_center_freq(centers, left_ip)
+        f_right = _interp_center_freq(centers, right_ip)
+        bw = max(1e-3, float(abs(f_right - f_left)))
+
+        q = float(np.clip(f0 / bw, 0.3, 12.0))
+
+        filters.append({
+            "type": "peaking",
+            "f0_hz": f0,
+            "gain_db": gain,
+            "q": q,
+        })
+
+        if len(filters) >= max_filters:
+            break
+
+    return filters[:max_filters]
 
 def load_descriptor(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
