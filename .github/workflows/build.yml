@@ -39,6 +39,7 @@ jobs:
           if (!(Test-Path "wtgui.py")) { throw "Falta wtgui.py (entrypoint GUI)" }
           if (!(Test-Path "wtdiag-1.py")) { throw "Falta wtdiag-1.py (core)" }
           if (!(Test-Path "wtdiag-2.py")) { throw "Falta wtdiag-2.py (CLI/front)" }
+          if (!(Test-Path "wtdiag.py")) { throw "Falta wtdiag.py (wrapper importable para GUI)" }
 
       - name: Build EXE (PyInstaller onedir, windowed)
         shell: pwsh
@@ -51,6 +52,7 @@ jobs:
             --name "$env:APP_NAME" `
             --add-data "wtdiag-1.py;." `
             --add-data "wtdiag-2.py;." `
+            --add-data "wtdiag.py;." `
             wtgui.py
 
       - name: Upload artifact (EXE folder)
