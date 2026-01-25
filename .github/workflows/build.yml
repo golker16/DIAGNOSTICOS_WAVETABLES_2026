@@ -1,0 +1,106 @@
+name: Wavetable Diagnoser (Index + Match + EXE)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Index + Match (cloud)
+    runs-on: windows-latest
+
+    env:
+      TABLE_SIZE: "2048"
+      HARMONICS: "64"
+      BANDS: "128"
+      TOPK: "20"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Index wavetables
+        shell: pwsh
+        run: |
+          if (!(Test-Path "wavetables")) { throw "No existe carpeta ./wavetables" }
+          python wtdiag.py index --in "wavetables" --out "db" --table-size $env:TABLE_SIZE --harmonics $env:HARMONICS --bands $env:BANDS
+
+      - name: Match targets (optional)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+          if (Test-Path "targets") {
+            $targets = Get-ChildItem "targets" -Filter *.wav -File
+            if ($targets.Count -gt 0) {
+              foreach ($t in $targets) {
+                $out = Join-Path "reports" ($t.BaseName + "_match.json")
+                python wtdiag.py match --db "db" --target $t.FullName --out $out --table-size $env:TABLE_SIZE --harmonics $env:HARMONICS --bands $env:BANDS --topk $env:TOPK --eq-limit-db 6 --eq-smooth 1.5
+              }
+            } else {
+              Write-Host "No hay WAVs en ./targets, se omite match."
+            }
+          } else {
+            Write-Host "No existe ./targets, se omite match."
+          }
+
+      - name: Upload artifacts (db + reports)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wt-analysis-db-and-reports
+          path: |
+            db/**
+            reports/**
+          if-no-files-found: error
+
+  build_exe:
+    name: Build EXE (PyInstaller onedir)
+    runs-on: windows-latest
+    needs: analyze
+
+    env:
+      APP_NAME: WTDiag
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps + PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build onedir exe
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onedir --name "$env:APP_NAME" wtdiag.py
+
+      - name: Upload artifact (exe folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WTDiag-windows-onedir
+          path: dist/${{ env.APP_NAME }}/
+          if-no-files-found: error
