@@ -1,5 +1,4 @@
 # wtgui.py
-from types import SimpleNamespace
 import threading
 import queue
 import logging
