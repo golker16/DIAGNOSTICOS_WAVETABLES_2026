@@ -2,7 +2,12 @@
 # Core del motor (DSP/features/descriptor/matching helpers)
 # Nota: se carga dinámicamente desde wtdiag-2.py y wtgui.py (porque el nombre tiene guion).
 
-import json
+# ✅ FIX: fallback si el build “rompe” stdlib json
+try:
+    import json  # stdlib
+except ModuleNotFoundError:
+    import simplejson as json  # fallback para builds rotos
+
 import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -752,7 +757,10 @@ def process_wavetable(path: Path, table_size: int, n_harm: int, n_bands: int) ->
     elif wtype == "multi_frame":
         x = ensure_len(x, in_table * num_frames)
         raw_frames = x.reshape(num_frames, in_table)
-        frames = np.stack([standardize_frame(raw_frames[i], table_size, loop_fix=True) for i in range(num_frames)], axis=0)
+        frames = np.stack(
+            [standardize_frame(raw_frames[i], table_size, loop_fix=True) for i in range(num_frames)],
+            axis=0
+        )
 
     else:
         # type="sample": se sigue extrayendo features (útil para diagnosticar),
@@ -800,11 +808,6 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
     Convierte delta_env_db (en bandas log) a una lista de filtros paramétricos aproximados:
       - low_shelf / high_shelf (para "tilt" global)
       - peaking con Q variable (según ancho del pico/valle)
-
-    Heurística (sin optimización pesada):
-      1) Ajuste lineal de delta vs log(f) => tilt global
-      2) Si tilt es fuerte, lo capturamos con 1 shelf
-      3) Residual => picos/valles => peaking con Q estimado por peak_widths
     """
     d = np.array(delta_db, dtype=np.float32)
     n = len(d)
@@ -824,46 +827,27 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
     pred = (a * logf + b).astype(np.float32)
     tilt_gain = float(pred[-1] - pred[0])  # dB high - low (aprox)
 
-    # Umbral: si el tilt a lo largo del rango es significativo, usamos un shelf
-    # (ajusta este valor si quieres más/menos agresivo)
     TILT_THR_DB = 3.0
-
     residual = d.copy()
 
     if abs(tilt_gain) >= TILT_THR_DB and max_filters >= 1:
-        # Corner heurístico: banda ~40% o ~60% según tipo
         if tilt_gain > 0:
             f0 = float(centers[int(np.clip(int(0.60 * (n - 1)), 0, n - 1))])
-            filters.append({
-                "type": "high_shelf",
-                "f0_hz": f0,
-                "gain_db": float(tilt_gain),
-                "slope": 1.0,
-            })
+            filters.append({"type": "high_shelf", "f0_hz": f0, "gain_db": float(tilt_gain), "slope": 1.0})
         else:
             f0 = float(centers[int(np.clip(int(0.40 * (n - 1)), 0, n - 1))])
-            filters.append({
-                "type": "low_shelf",
-                "f0_hz": f0,
-                "gain_db": float(abs(tilt_gain)),
-                "slope": 1.0,
-            })
+            filters.append({"type": "low_shelf", "f0_hz": f0, "gain_db": float(abs(tilt_gain)), "slope": 1.0})
 
-        # Removemos el tilt modelado (aprox)
         residual = (d - pred).astype(np.float32)
 
     remaining = max(0, max_filters - len(filters))
     if remaining <= 0:
         return filters
 
-    # 2) Picos y valles en residual
-    # Reglas: distancia mínima por banda + mínima ganancia para no meter filtros por ruido
     MIN_PROM_DB = 1.0
     MIN_GAIN_DB = 0.8
 
-    # Peaks (positivos)
     peaks, props_p = find_peaks(residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
-    # Valleys (negativos) => peaks sobre -residual
     valleys, props_v = find_peaks(-residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
 
     candidates: List[Tuple[float, int, str, float]] = []
@@ -877,7 +861,6 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
         gain = float(residual[v])  # negativo
         candidates.append((abs(gain) + 0.25 * prom, int(v), "peaking", gain))
 
-    # Orden por "importancia"
     candidates.sort(key=lambda t: t[0], reverse=True)
 
     chosen_idx: List[int] = []
@@ -893,9 +876,6 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
     if not chosen_idx:
         return filters
 
-    # 3) Estimar Q variable con peak_widths
-    # peak_widths requiere peaks sobre una señal positiva;
-    # para valles usamos -residual para medir width igualmente.
     for idx in chosen_idx:
         gain = float(residual[idx])
         if abs(gain) < MIN_GAIN_DB:
@@ -906,8 +886,8 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
         else:
             w_res = peak_widths(-residual, peaks=np.array([idx]), rel_height=0.5)
 
-        left_ip = float(w_res[2][0])  # left_ips
-        right_ip = float(w_res[3][0]) # right_ips
+        left_ip = float(w_res[2][0])   # left_ips
+        right_ip = float(w_res[3][0])  # right_ips
 
         f0 = float(centers[idx])
         f_left = _interp_center_freq(centers, left_ip)
@@ -916,12 +896,7 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
 
         q = float(np.clip(f0 / bw, 0.3, 12.0))
 
-        filters.append({
-            "type": "peaking",
-            "f0_hz": f0,
-            "gain_db": gain,
-            "q": q,
-        })
+        filters.append({"type": "peaking", "f0_hz": f0, "gain_db": gain, "q": q})
 
         if len(filters) >= max_filters:
             break
