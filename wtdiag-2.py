@@ -3,7 +3,13 @@
 # Carga el core desde wtdiag-1.py vía importlib (porque el archivo tiene guion).
 
 import argparse
-import json
+
+# --- FIX: fallback si el build “rompe” stdlib json ---
+try:
+    import json  # stdlib
+except ModuleNotFoundError:
+    import simplejson as json  # fallback para builds rotos
+
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
