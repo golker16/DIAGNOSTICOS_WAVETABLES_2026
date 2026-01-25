@@ -7,6 +7,7 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Optional  # <-- FIX
+from types import SimpleNamespace  # <-- FIX: para crear args tipo argparse
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -386,16 +387,17 @@ class App(tk.Tk):
 
     def _worker_index(self, in_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
-            class Args:
-                in_dir = str(in_p)
-                out_dir = str(out_p)
-                table_size = int(ts)
-                harmonics = int(harm)
-                bands = int(bands)
+            args = SimpleNamespace(
+                in_dir=str(in_p),
+                out_dir=str(out_p),
+                table_size=int(ts),
+                harmonics=int(harm),
+                bands=int(bands),
                 # Nota: no exponemos include_samples en UI Index (por defecto False).
                 # cmd_index usa getattr(..., False), así que está OK.
+            )
 
-            rc = wtdiag.cmd_index(Args())
+            rc = wtdiag.cmd_index(args)
             if rc == 0:
                 self.logger.info("Indexado OK. Se generó _INDEX.json y descriptores.")
                 self.logger.info(f"Log guardado en: {out_p / 'wt_gui.log'}")
@@ -434,14 +436,15 @@ class App(tk.Tk):
 
     def _worker_diag(self, wav_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
-            class Args:
-                wav = str(wav_p)
-                out = str(out_p)
-                table_size = int(ts)
-                harmonics = int(harm)
-                bands = int(bands)
+            args = SimpleNamespace(
+                wav=str(wav_p),
+                out=str(out_p),
+                table_size=int(ts),
+                harmonics=int(harm),
+                bands=int(bands),
+            )
 
-            rc = wtdiag.cmd_diag(Args())
+            rc = wtdiag.cmd_diag(args)
             if rc == 0:
                 self.logger.info("Diag OK. Se generó descriptor JSON.")
                 self.logger.info(f"Log guardado en: {out_p.parent / 'wt_gui.log'}")
@@ -496,19 +499,20 @@ class App(tk.Tk):
 
     def _worker_match(self, db_p: Path, target_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
-            class Args:
-                db_dir = str(db_p)
-                target = str(target_p)
-                out = str(out_p)
-                table_size = int(ts)
-                harmonics = int(harm)
-                bands = int(bands)
-                topk = int(self.match_topk.get())
-                eq_limit_db = float(self.match_eq_limit.get())
-                eq_smooth = float(self.match_eq_smooth.get())
-                include_samples = bool(self.match_include_samples.get())
+            args = SimpleNamespace(
+                db_dir=str(db_p),
+                target=str(target_p),
+                out=str(out_p),
+                table_size=int(ts),
+                harmonics=int(harm),
+                bands=int(bands),
+                topk=int(self.match_topk.get()),
+                eq_limit_db=float(self.match_eq_limit.get()),
+                eq_smooth=float(self.match_eq_smooth.get()),
+                include_samples=bool(self.match_include_samples.get()),
+            )
 
-            rc = wtdiag.cmd_match(Args())
+            rc = wtdiag.cmd_match(args)
             if rc == 0:
                 self.logger.info("Match OK. Se generó report JSON y .txt.")
                 self.logger.info(f"Report: {out_p}")
