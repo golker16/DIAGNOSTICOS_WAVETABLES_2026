@@ -13,7 +13,6 @@ import numpy as np
 
 
 def _resource_path(rel_name: str) -> Path:
-    # Compatible con PyInstaller (sys._MEIPASS) y con ejecución normal
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / rel_name
 
@@ -21,7 +20,6 @@ def _resource_path(rel_name: str) -> Path:
 def _load_core():
     core_path = _resource_path("wtdiag-1.py")
     if not core_path.exists():
-        # fallback por si ejecutan desde repo y no está en _MEIPASS
         core_path = Path(__file__).resolve().parent / "wtdiag-1.py"
 
     spec = importlib.util.spec_from_file_location("wtdiag_core", str(core_path))
@@ -34,9 +32,8 @@ def _load_core():
 
 
 core = _load_core()
-
-# Re-export útil (por si alguien quiere importar desde este "frente")
 FEATURE_SR = core.FEATURE_SR
+
 
 # ----------------------------
 # Indexado
@@ -70,15 +67,24 @@ def cmd_index(args) -> int:
                 "family": desc.diagnosis.family,
                 "best_for": desc.diagnosis.best_for
             })
-            print(f"[{i:5d}/{len(wavs):5d}] OK  {p.name}  -> {out_json.name}")
+
+            if i % 50 == 0:
+                print(f"[index] {i}/{len(wavs)} ...")
         except Exception as e:
-            print(f"[{i:5d}/{len(wavs):5d}] FAIL {p.name}  ({e})")
+            print(f"[index] ERROR en {p}: {e}")
 
-    index_path = out_dir / "_INDEX.json"
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump({"root": str(in_dir.as_posix()), "entries": db_entries}, f, ensure_ascii=False, indent=2)
+    index = {
+        "tableSize": int(args.table_size),
+        "harmonics": int(args.harmonics),
+        "bands": int(args.bands),
+        "count": len(db_entries),
+        "entries": db_entries
+    }
 
-    print(f"\n[index] Listo. Index global: {index_path}")
+    with open(out_dir / "_INDEX.json", "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+    print(f"[index] OK. Descriptores: {len(db_entries)} en {out_dir}")
     return 0
 
 
@@ -97,6 +103,7 @@ def cmd_diag(args) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
+
     print(f"[diag] OK -> {out}")
     return 0
 
@@ -105,88 +112,122 @@ def cmd_diag(args) -> int:
 # Matching
 # ----------------------------
 
+def _get_arg(args, name: str, default):
+    return getattr(args, name, default)
+
 def cmd_match(args) -> int:
-    db_dir = Path(args.db_dir)
+    db_dir = Path(_get_arg(args, "db_dir", _get_arg(args, "db", "")))
     index_path = db_dir / "_INDEX.json"
     if not index_path.exists():
         print("[match] No existe _INDEX.json. Primero corre index.")
         return 2
 
-    target_path = Path(args.target)
+    target_path = Path(_get_arg(args, "target", ""))
     if not target_path.exists():
         print(f"[match] Target no existe: {target_path}")
         return 2
 
+    out_path = Path(_get_arg(args, "out", "match_report.json"))
+
     tx, _tsr = core.safe_read_wav(target_path)
     tx = core.standardize_audio(tx)
 
-    if len(tx) >= args.table_size:
-        start = (len(tx) - args.table_size) // 2
-        tframe = tx[start:start + args.table_size]
-    else:
-        tframe = tx
-
-    tframe = core.standardize_frame(tframe, args.table_size)
-    tfeat = core.compute_features_for_frame(tframe, args.harmonics, args.bands)
+    # Tramo estable (evita el centro a ciegas)
+    tseg = core.select_stable_segment(tx, int(args.table_size))
+    tframe = core.standardize_frame(tseg, int(args.table_size), loop_fix=True)
+    tfeat = core.compute_features_for_frame(tframe, int(args.harmonics), int(args.bands))
 
     th = np.array(tfeat.harmonics, dtype=np.float32)
     tenv = np.array(tfeat.spectral_env_db, dtype=np.float32)
 
     with open(index_path, "r", encoding="utf-8") as f:
         idx = json.load(f)
+
     entries = idx.get("entries", [])
+    if not entries:
+        print("[match] Índice vacío.")
+        return 2
 
-    scored: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-    for it in entries:
+    topk = int(_get_arg(args, "topk", 50))
+    topn = int(_get_arg(args, "topn", 10))
+    include_unknown = bool(_get_arg(args, "include_samples", False))
+    gain_mode = str(_get_arg(args, "gain_mode", "rms")).lower()
+    gain_mode = "lufs" if gain_mode == "lufs" else "rms"
+
+    # 1) Top-K por armónicos (ADN)
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for ent in entries:
+        dpath = db_dir / ent["descriptor"]
         try:
-            dpath = db_dir / it["descriptor"]
             desc = core.load_descriptor(dpath)
-
-            if desc.get("type") == "sample" and not args.include_samples:
-                continue
-
-            ch_list, _cenv_list, _c_rms = core.get_desc_features(desc)
-            ch = np.array(ch_list, dtype=np.float32)
-
-            dist = core.cosine_distance(th, ch)
-            scored.append((dist, it, desc))
         except Exception:
             continue
 
-    if not scored:
-        print("[match] Base vacía o no compatible.")
-        return 3
+        if desc.get("type") == "unknown" and not include_unknown:
+            continue
 
-    scored.sort(key=lambda x: x[0])
-    top = scored[:args.topk]
+        try:
+            h, _e, _r, _l = core.get_desc_features(desc)
+        except Exception:
+            continue
+
+        ch = np.array(h, dtype=np.float32)
+        scored.append((core.cosine_distance(th, ch), desc))
+
+    if not scored:
+        print("[match] No hay candidatos tras filtros.")
+        return 2
+
+    scored.sort(key=lambda t: t[0])
+    top = scored[: max(1, topk)]
+
+    # 2) Refinar por envelope + penalización EQ
+    eq_limit_db = float(_get_arg(args, "eq_limit_db", 6.0))
+    eq_smooth = float(_get_arg(args, "eq_smooth", 1.5))
+    max_filters = int(_get_arg(args, "max_filters", 6))
+    min_sep_bands = int(_get_arg(args, "min_sep_bands", 6))
+    w_harm = float(_get_arg(args, "w_harm", 1.0))
+    w_eq = float(_get_arg(args, "w_eq", 0.8))
 
     results: List[Dict[str, Any]] = []
-    for rank, (hdist, it, desc) in enumerate(top, 1):
-        _ch_list, cenv_list, c_rms = core.get_desc_features(desc)
-        cenv = np.array(cenv_list, dtype=np.float32)
+    for harm_err, desc in top:
+        _h, e, r, l = core.get_desc_features(desc)
+        cand_env = np.array(e, dtype=np.float32)
 
-        delta = tenv - cenv
-        delta = core.smooth_and_limit_delta(delta, limit_db=args.eq_limit_db, smooth_sigma=args.eq_smooth)
+        delta = tenv - cand_env
+        delta = core.smooth_and_limit_delta(delta, limit_db=eq_limit_db, smooth_sigma=eq_smooth)
 
-        peq = core.delta_to_peq(delta, sr=core.FEATURE_SR, max_filters=6, min_sep_bands=6)
+        peq = core.delta_to_peq(delta, sr=core.FEATURE_SR, max_filters=max_filters, min_sep_bands=min_sep_bands)
 
-        t_rms = float(tfeat.rms_dbfs)
-        gain_db = float(t_rms - float(c_rms))
+        eq_cost = float(np.mean(np.abs(delta))) / max(1e-6, eq_limit_db)
 
-        eq_cost = float(np.mean(np.abs(delta)) / max(1e-6, args.eq_limit_db))
-        score = float(hdist * 0.75 + eq_cost * 0.25)
+        cand_gain = float(l if gain_mode == "lufs" else r)
+        tgt_gain = float(tfeat.lufs if gain_mode == "lufs" else tfeat.rms_dbfs)
+        gain_delta_db = tgt_gain - cand_gain
+
+        score = float(harm_err * w_harm + eq_cost * w_eq)
 
         results.append({
-            "rank": rank,
-            "wavetable_path": desc.get("path", it.get("path")),
-            "descriptor": it["descriptor"],
             "score": score,
-            "harmonic_cosine_dist": float(hdist),
-            "gain_db_suggested": gain_db,
+            "harmonic_error": float(harm_err),
+            "eq_cost": eq_cost,
+            "path": desc.get("path"),
+            "type": desc.get("type"),
+            "family": desc.get("diagnosis", {}).get("family"),
+            "best_for": desc.get("diagnosis", {}).get("best_for", []),
+            "gain_match": {
+                "mode": "lufs" if gain_mode == "lufs" else "rms_dbfs",
+                "target": tgt_gain,
+                "candidate": cand_gain,
+                "gain_delta_db": gain_delta_db
+            },
             "delta_env_db": delta.tolist(),
             "peq_filters": peq,
             "diagnosis": desc.get("diagnosis", {})
         })
+
+    results.sort(key=lambda r: r["score"])
+    results = results[: max(1, topn)]
 
     suggestions: List[str] = []
     if tfeat.noise_ratio_db > -12 or tfeat.tonalness < 0.6:
@@ -196,63 +237,64 @@ def cmd_match(args) -> int:
 
     report: Dict[str, Any] = {
         "target": str(target_path.as_posix()),
+        "target_selection": {"method": "stable_segment", "tableSize": int(args.table_size)},
         "target_features": {
             "tonalness": tfeat.tonalness,
             "noise_ratio_db": tfeat.noise_ratio_db,
             "brightness": tfeat.brightness,
             "odd_even_ratio": tfeat.odd_even_ratio,
+            "rolloff": tfeat.rolloff,
+            "crest_db": tfeat.crest_db,
             "rms_dbfs": tfeat.rms_dbfs,
-            "crest_db": tfeat.crest_db
-        },
-        "search_params": {
-            "table_size": args.table_size,
-            "harmonics": args.harmonics,
-            "bands": args.bands,
-            "topk": args.topk,
-            "eq_limit_db": args.eq_limit_db,
-            "eq_smooth": args.eq_smooth,
+            "lufs": tfeat.lufs,
             "feature_sr": core.FEATURE_SR
+        },
+        "matching": {
+            "topk": topk,
+            "topn": topn,
+            "gain_mode": gain_mode,
+            "w_harm": w_harm,
+            "w_eq": w_eq,
+            "eq_limit_db": eq_limit_db,
+            "eq_smooth": eq_smooth,
+            "max_filters": max_filters,
+            "min_sep_bands": min_sep_bands
         },
         "suggestions": suggestions,
         "matches": results
     }
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # TXT humano (igual que antes)
     txt_path = out_path.with_suffix(".txt")
     lines: List[str] = []
     lines.append("WAVETABLE MATCH REPORT")
-    lines.append(f"Target: {target_path}")
-    lines.append(f"Target tonalness={tfeat.tonalness:.3f} noise_ratio_db={tfeat.noise_ratio_db:.2f} bright={tfeat.brightness:.3f}")
+    lines.append(f"Target: {report['target']}")
+    lines.append(f"Gain mode: {'lufs' if gain_mode=='lufs' else 'rms_dbfs'}")
+    lines.append("")
     if suggestions:
-        lines.append("Suggestions:")
+        lines.append("SUGERENCIAS:")
         for s in suggestions:
             lines.append(f" - {s}")
-    lines.append("")
-    for r in results:
-        lines.append(f"#{r['rank']} score={r['score']:.4f} harmDist={r['harmonic_cosine_dist']:.4f} gain={r['gain_db_suggested']:+.2f} dB")
-        lines.append(f"   WT: {r['wavetable_path']}")
-        d = r.get("diagnosis") or {}
-        if d:
-            lines.append(f"   family={d.get('family')} best_for={d.get('best_for')} pitch_friendly={d.get('pitch_friendly')}")
-            lines.append(f"   notes: {d.get('notes')}")
-        lines.append(f"   delta_env_db: meanAbs={float(np.mean(np.abs(r['delta_env_db']))):.2f} dB (limit {args.eq_limit_db} dB)")
-        peq = r.get("peq_filters", [])
-        if peq:
-            lines.append("   PEQ approx:")
-            for flt in peq:
-                lines.append(f"     - peaking f0={flt['f0_hz']:.1f}Hz gain={flt['gain_db']:+.2f}dB Q={flt['q']:.2f}")
+        lines.append("")
+
+    for i, m in enumerate(results, 1):
+        lines.append(f"#{i} score={m['score']:.4f}  harm={m['harmonic_error']:.4f}  eq={m['eq_cost']:.4f}")
+        lines.append(f"   {m['path']}  [{m.get('type')}/{m.get('family')}] best_for={m.get('best_for')}")
+        gm = m["gain_match"]
+        lines.append(f"   gainMatch({gm['mode']}): target={gm['target']:.2f} cand={gm['candidate']:.2f} delta={gm['gain_delta_db']:.2f} dB")
+        if m.get("peq_filters"):
+            lines.append("   PEQ:")
+            for flt in m["peq_filters"]:
+                lines.append(f"     - peaking f0={flt['f0_hz']:.1f}Hz gain={flt['gain_db']:.2f}dB Q={flt['q']:.2f}")
         lines.append("")
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"[match] OK -> {out_path}")
-    print(f"[match] TXT -> {txt_path}")
+    print(f"[match] OK -> {out_path} (+ {txt_path.name})")
     return 0
 
 
@@ -288,9 +330,15 @@ def main():
     p_match.add_argument("--harmonics", type=int, default=64)
     p_match.add_argument("--bands", type=int, default=128)
     p_match.add_argument("--topk", type=int, default=15)
+    p_match.add_argument("--topn", type=int, default=10)
     p_match.add_argument("--eq-limit-db", type=float, default=6.0)
     p_match.add_argument("--eq-smooth", type=float, default=1.5)
-    p_match.add_argument("--include-samples", action="store_true")
+    p_match.add_argument("--include-samples", action="store_true", help="Incluye type='unknown'")
+    p_match.add_argument("--gain-mode", choices=["rms", "lufs"], default="rms")
+    p_match.add_argument("--max-filters", type=int, default=6)
+    p_match.add_argument("--min-sep-bands", type=int, default=6)
+    p_match.add_argument("--w-harm", type=float, default=1.0)
+    p_match.add_argument("--w-eq", type=float, default=0.8)
     p_match.set_defaults(func=cmd_match)
 
     args = ap.parse_args()
@@ -299,3 +347,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
