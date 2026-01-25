@@ -50,6 +50,11 @@ jobs:
             --onedir `
             --windowed `
             --name "$env:APP_NAME" `
+            --hidden-import "json" `
+            --hidden-import "json.encoder" `
+            --hidden-import "json.decoder" `
+            --hidden-import "json.scanner" `
+            --hidden-import "simplejson" `
             --add-data "wtdiag-1.py;." `
             --add-data "wtdiag-2.py;." `
             --add-data "wtdiag.py;." `
