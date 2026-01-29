@@ -74,7 +74,6 @@ def _index_one(
     include_samples: bool,
     *,
     pro: bool = False,
-    pro_wav_dir: Optional[Path] = None
 ) -> Dict[str, Any]:
     """
     Worker para index en paralelo.
@@ -91,15 +90,15 @@ def _index_one(
         export_meta: Optional[Dict[str, Any]] = None
 
         if pro:
-            if pro_wav_dir is None:
-                pro_wav_dir = out_dir / "EXPORT" / "WAV"
-            pro_wav_dir.mkdir(parents=True, exist_ok=True)
+            # ✅ PRO: exporta WAV canónico + descriptor grande EN LA MISMA CARPETA (out_dir)
+            # y con el MISMO nombre base.
 
-            # Formato canónico fijo:
-            # 2048 x 64, PCM16, SR fijo (core.PRO_SR)
             base = _safe_export_base_name(in_dir, wav_path)
-            export_name = f"{base}__2048x64__v1.wav"
-            export_path = pro_wav_dir / export_name
+            base_can = f"{base}__CAN__2048x64"  # recomendado
+
+            export_path = out_dir / f"{base_can}.wav"
+            out_json_name = f"{base_can}.json"
+            out_json = out_dir / out_json_name
 
             export_meta = core.export_canonical_wavetable(
                 wav_path,
@@ -108,7 +107,8 @@ def _index_one(
                 num_frames=core.PRO_NUM_FRAMES,
                 sr_out=core.PRO_SR,
                 loop_fix=True,
-                write_sidecar_json=True,
+                # ✅ sidecar apagado (lo quitamos del export)
+                write_sidecar_json=False,
             )
 
             # Si el original era sample y no queremos incluir samples, lo saltamos.
@@ -124,17 +124,40 @@ def _index_one(
             # Diagnosticar el export (no el original), para que desc.path apunte al canónico.
             desc = core.process_wavetable(export_path, core.PRO_TABLE_SIZE, harmonics, bands)
 
-        else:
-            # comportamiento original
-            desc = core.process_wavetable(wav_path, table_size, harmonics, bands)
+            # Guardar descriptor grande al lado del wav canónico (mismo nombre base)
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
 
-            # Evitar “contaminar” la DB con archivos no-wavetable
-            if desc.type == "sample" and not include_samples:
-                return {
-                    "ok": False,
-                    "skipped_sample": True,
-                    "wav": str(wav_path),
-                }
+            entry: Dict[str, Any] = {
+                "path": str(export_path.as_posix()),   # ✅ wav canónico (plugin-safe)
+                "descriptor": out_json_name,           # ✅ json grande al lado
+                "type": desc.type,
+                "family": desc.diagnosis.family,
+                "best_for": desc.diagnosis.best_for,
+                "source_path": source_path_str,        # ✅ auditoría opcional
+                "pro": True,
+            }
+
+            return {
+                "ok": True,
+                "skipped_sample": False,
+                "out_json_name": out_json_name,
+                "entry": entry,
+                "wav": str(wav_path),
+            }
+
+        # -------------------------
+        # NO PRO: comportamiento original
+        # -------------------------
+        desc = core.process_wavetable(wav_path, table_size, harmonics, bands)
+
+        # Evitar “contaminar” la DB con archivos no-wavetable
+        if desc.type == "sample" and not include_samples:
+            return {
+                "ok": False,
+                "skipped_sample": True,
+                "wav": str(wav_path),
+            }
 
         out_name = _safe_descriptor_name(in_dir, wav_path)
         out_json = out_dir / out_name
@@ -142,21 +165,13 @@ def _index_one(
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
 
-        entry: Dict[str, Any] = {
-            # ✅ CLAVE: en modo PRO, desc.path ya es el WAV canónico exportado
+        entry = {
             "path": desc.path,
             "descriptor": out_name,
             "type": desc.type,
             "family": desc.diagnosis.family,
             "best_for": desc.diagnosis.best_for,
         }
-
-        # Auditoría opcional: guardar ruta fuente original
-        if pro:
-            entry["source_path"] = source_path_str
-            # útil para depuración / tooling externo
-            entry["pro"] = True
-
         return {
             "ok": True,
             "skipped_sample": False,
@@ -191,23 +206,19 @@ def cmd_index(args) -> int:
     pro = bool(getattr(args, "pro", False))
     pro_wav_dir_arg = getattr(args, "pro_wav_dir", None)
 
+    # ✅ Nota: ahora en PRO ya NO usamos out_dir/EXPORT/WAV.
+    # Todo va directo a out_dir (un solo output folder).
+    if pro_wav_dir_arg:
+        # mantenemos el flag por compat, pero ya no se usa
+        print(f"[index] NOTE: --pro-wav-dir ya no se usa (outputs PRO van directo a --out). Ignorando: {pro_wav_dir_arg}")
+
     # En modo PRO, forzamos el idioma único (2048x64).
-    # - table_size se fuerza a 2048
-    # - num_frames vive en export y es 64 (no se expone)
     if pro:
         if int(getattr(args, "table_size", core.PRO_TABLE_SIZE)) != int(core.PRO_TABLE_SIZE):
             print(f"[index] --pro activo: forzando table_size={core.PRO_TABLE_SIZE} (ignorando {args.table_size})")
         table_size = int(core.PRO_TABLE_SIZE)
-
-        # Carpeta export por defecto
-        if pro_wav_dir_arg:
-            pro_wav_dir = Path(pro_wav_dir_arg)
-        else:
-            pro_wav_dir = out_dir / "EXPORT" / "WAV"
-        pro_wav_dir.mkdir(parents=True, exist_ok=True)
     else:
         table_size = int(args.table_size)
-        pro_wav_dir = None
 
     processed = 0
     kept = 0
@@ -235,7 +246,6 @@ def cmd_index(args) -> int:
                 bands=int(args.bands),
                 include_samples=include_samples,
                 pro=pro,
-                pro_wav_dir=pro_wav_dir,
             )
 
             if res.get("skipped_sample"):
@@ -259,7 +269,6 @@ def cmd_index(args) -> int:
                     table_size, int(args.harmonics), int(args.bands),
                     include_samples,
                     pro=pro,
-                    pro_wav_dir=pro_wav_dir,
                 )
                 for p in wavs
             ]
@@ -308,8 +317,9 @@ def cmd_index(args) -> int:
             "sr_out": int(core.PRO_SR),
             "pcm": "PCM_16",
             "layout": "mono_concatenated_frames",
+            "naming": "__CAN__2048x64",
         }
-        index["pro_wav_dir"] = str((pro_wav_dir or (out_dir / "EXPORT" / "WAV")).as_posix())
+        index["pro_outputs_dir"] = str(out_dir.as_posix())
 
     with open(out_dir / "_INDEX.json", "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
@@ -325,8 +335,7 @@ def cmd_index(args) -> int:
         f"  skipped_samples: {skipped_samples} (include_samples={include_samples})\n"
         f"  params:          tableSize={int(table_size)} harmonics={int(args.harmonics)} bands={int(args.bands)} feature_sr={int(core.FEATURE_SR)}\n"
         f"  pro:             {pro}\n"
-        + (f"  pro_wav_dir:      {pro_wav_dir}\n" if pro else "")
-        + (f"  pro_format:       2048x64 PCM16 sr_out={core.PRO_SR}\n" if pro else "")
+        + (f"  pro_format:       2048x64 PCM16 sr_out={core.PRO_SR} (WAV+JSON en out_dir)\n" if pro else "")
         + f"  jobs:            {jobs}"
     )
     return 0
@@ -376,7 +385,6 @@ def _compat_warning(index_meta: Dict[str, Any], args) -> Tuple[bool, str, Dict[s
     req_fs = int(core.FEATURE_SR)
 
     mismatch = (idx_ts != req_ts) or (idx_h != req_h) or (idx_b != req_b)
-    # feature_sr: si viene en index, también comparamos
     if idx_fs is not None:
         try:
             mismatch = mismatch or (int(idx_fs) != req_fs)
@@ -447,14 +455,13 @@ def cmd_match(args) -> int:
     gain_mode = str(_get_arg(args, "gain_mode", "rms")).lower()
     gain_mode = "lufs" if gain_mode == "lufs" else "rms"
 
-    # Contadores de calidad / skips (ANTES: se ignoraba silenciosamente)
     counters = {
         "entries_total": int(len(entries)),
         "descriptor_loaded_ok": 0,
         "skipped_samples": 0,
         "skipped_bad_json": 0,
         "skipped_schema": 0,
-        "skipped_compat": 0,   # feature_sr mismatch u otras incompatibilidades
+        "skipped_compat": 0,
         "skipped_features": 0,
         "other_errors": 0,
     }
@@ -468,7 +475,6 @@ def cmd_match(args) -> int:
             counters["descriptor_loaded_ok"] += 1
         except Exception as e:
             msg = str(e).lower()
-            # Heurística simple para clasificar el motivo
             if "json" in msg and ("invál" in msg or "inval" in msg or "decode" in msg):
                 counters["skipped_bad_json"] += 1
             elif "feature_sr" in msg or "reindex" in msg or "parámetros" in msg or "parametros" in msg:
@@ -479,7 +485,6 @@ def cmd_match(args) -> int:
                 counters["other_errors"] += 1
             continue
 
-        # tipo “no wavetable” ahora es sample
         if desc.get("type") == "sample" and not include_samples:
             counters["skipped_samples"] += 1
             continue
@@ -516,8 +521,6 @@ def cmd_match(args) -> int:
         _h, e, r, l = core.get_desc_features(desc)
         cand_env = np.array(e, dtype=np.float32)
 
-        # Si por alguna razón bands difieren (mismatch), igual intentamos,
-        # pero si longitudes no coinciden, skip (mejor que romper)
         if cand_env.shape != tenv.shape:
             counters["skipped_compat"] += 1
             continue
@@ -576,7 +579,7 @@ def cmd_match(args) -> int:
         "target": str(target_path.as_posix()),
         "target_selection": {"method": "stable_segment", "tableSize": int(args.table_size)},
         "db_compat": compat_obj,
-        "summary": counters,  # ✅ guardamos contadores en el JSON
+        "summary": counters,
         "target_features": {
             "tonalness": tfeat.tonalness,
             "noise_ratio_db": tfeat.noise_ratio_db,
@@ -608,7 +611,6 @@ def cmd_match(args) -> int:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # TXT legible (+ resumen de skips)
     txt_path = out_path.with_suffix(".txt")
     lines: List[str] = []
     lines.append("WAVETABLE MATCH REPORT")
@@ -653,7 +655,6 @@ def cmd_match(args) -> int:
                 f0 = float(flt.get("f0_hz", 0.0))
                 gain = float(flt.get("gain_db", 0.0))
 
-                # Compatible con shelves (no siempre tienen Q)
                 if ftype in ("low_shelf", "high_shelf"):
                     slope = float(flt.get("slope", 1.0))
                     lines.append(f"     - {ftype} f0={f0:.1f}Hz gain={gain:.2f}dB slope={slope:.2f}")
@@ -666,7 +667,6 @@ def cmd_match(args) -> int:
         f.write("\n".join(lines))
 
     print(f"[match] OK -> {out_path} (+ {txt_path.name})")
-    # ✅ print resumen visible en consola
     print(f"[match] summary: {counters}")
     return 0
 
@@ -686,14 +686,12 @@ def main():
     p_index.add_argument("--harmonics", type=int, default=64)
     p_index.add_argument("--bands", type=int, default=128)
 
-    # NUEVO: evitar contaminar DB (por defecto NO indexa type='sample')
     p_index.add_argument(
         "--include-samples",
         action="store_true",
         help="Incluye type='sample' (archivos no-wavetable)"
     )
 
-    # ✅ NUEVO: paralelización opcional
     p_index.add_argument(
         "--jobs",
         type=int,
@@ -701,16 +699,18 @@ def main():
         help="Número de workers para index paralelo (default=1)."
     )
 
-    # ✅ NUEVO: Modo PRO export canónico
+    # ✅ Modo PRO export canónico
     p_index.add_argument(
         "--pro",
         action="store_true",
         help="Exporta cada wavetable a formato canónico (2048x64 PCM16) y hace que el índice apunte a ese WAV (plugin-safe)."
     )
+
+    # ✅ Se mantiene por compat, pero ya no se usa
     p_index.add_argument(
         "--pro-wav-dir",
         default=None,
-        help="Carpeta donde guardar WAV canónicos PRO. Default: OUT/EXPORT/WAV"
+        help="(DEPRECATED) Ya no se usa. En PRO, WAV+JSON se guardan en --out."
     )
 
     p_index.set_defaults(func=cmd_index)
@@ -735,7 +735,6 @@ def main():
     p_match.add_argument("--eq-limit-db", type=float, default=6.0)
     p_match.add_argument("--eq-smooth", type=float, default=1.5)
 
-    # Ajustado: ahora realmente es sample (no unknown)
     p_match.add_argument("--include-samples", action="store_true", help="Incluye type='sample'")
 
     p_match.add_argument("--gain-mode", choices=["rms", "lufs"], default="rms")
@@ -751,4 +750,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
