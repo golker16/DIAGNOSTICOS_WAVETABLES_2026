@@ -18,6 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
+# ✅ NUEVO: sanitizado de nombres Windows + recorte por longitud
+import re
+import hashlib
+
 
 def _resource_path(rel_name: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -46,10 +50,34 @@ FEATURE_SR = core.FEATURE_SR
 # Indexado
 # ----------------------------
 
+# ✅ NUEVO: caracteres inválidos en Windows + control de longitud
+_WIN_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+
+
+def _sanitize_filename(name: str, max_len: int = 180) -> str:
+    # Reemplaza caracteres inválidos en Windows
+    name = _WIN_INVALID.sub("_", name)
+
+    # Windows no permite terminar en espacio o punto
+    name = name.strip(" .")
+
+    if not name:
+        name = "unnamed"
+
+    # Evita rutas/nombres larguísimos (muy común si relpath es largo)
+    if len(name) > max_len:
+        h = hashlib.sha1(name.encode("utf-8", "ignore")).hexdigest()[:10]
+        name = name[: max_len - 12] + "__" + h
+
+    return name
+
+
 def _safe_descriptor_name(in_dir: Path, wav_path: Path) -> str:
     rel = wav_path.relative_to(in_dir).as_posix()
     safe = rel.replace("/", "__").replace("\\", "__")
-    return Path(safe).with_suffix(".json").name
+    base = str(Path(safe).with_suffix("").name)
+    base = _sanitize_filename(base)
+    return f"{base}.json"
 
 
 def _safe_export_base_name(in_dir: Path, wav_path: Path) -> str:
@@ -60,8 +88,8 @@ def _safe_export_base_name(in_dir: Path, wav_path: Path) -> str:
     """
     rel = wav_path.relative_to(in_dir).as_posix()
     safe = rel.replace("/", "__").replace("\\", "__")
-    # sin sufijo .wav
-    return str(Path(safe).with_suffix("").name)
+    base = str(Path(safe).with_suffix("").name)
+    return _sanitize_filename(base)
 
 
 def _index_one(
@@ -80,11 +108,15 @@ def _index_one(
     Devuelve dict con:
       - ok: bool
       - skipped_sample: bool
-      - out_json_name: str (si ok)
+      - out_json_name: str (si ok o si skipped_sample pero se generó JSON en PRO)
       - entry: dict (si ok)
       - error: str (si falla)
       - wav: str
     """
+    # ✅ Para mejorar diagnósticos en except
+    out_json: Optional[Path] = None
+    export_path: Optional[Path] = None
+
     try:
         source_path_str = str(wav_path.as_posix())
         export_meta: Optional[Dict[str, Any]] = None
@@ -111,22 +143,29 @@ def _index_one(
                 write_sidecar_json=False,
             )
 
-            # Si el original era sample y no queremos incluir samples, lo saltamos.
-            # (Importante: tras export, el archivo ya parece multi_frame 64, así que
-            # desc.type ya no será "sample"; por eso usamos type_original del meta).
-            if str(export_meta.get("type_original", "")) == "sample" and not include_samples:
+            # ✅ NUEVO: NO retornar antes de escribir JSON (siempre genera JSON visible)
+            is_sample_original = (str(export_meta.get("type_original", "")) == "sample")
+
+            # Diagnosticar el export (siempre), para generar JSON visible
+            desc = core.process_wavetable(export_path, core.PRO_TABLE_SIZE, harmonics, bands)
+
+            spec = core.descriptor_to_spec(desc)
+            # Añade auditoría útil:
+            spec["source_path"] = source_path_str
+            spec["type_original"] = str(export_meta.get("type_original", ""))
+            spec["skipped_sample"] = bool(is_sample_original and not include_samples)
+
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(spec, f, ensure_ascii=False, indent=2)
+
+            # Si era sample y no queremos incluir samples, lo marcamos como skipped (pero el JSON ya existe)
+            if is_sample_original and not include_samples:
                 return {
                     "ok": False,
                     "skipped_sample": True,
+                    "out_json_name": out_json_name,
                     "wav": str(wav_path),
                 }
-
-            # Diagnosticar el export (no el original), para que desc.path apunte al canónico.
-            desc = core.process_wavetable(export_path, core.PRO_TABLE_SIZE, harmonics, bands)
-
-            # Guardar descriptor grande al lado del wav canónico (mismo nombre base)
-            with open(out_json, "w", encoding="utf-8") as f:
-                json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
 
             entry: Dict[str, Any] = {
                 "path": str(export_path.as_posix()),   # ✅ wav canónico (plugin-safe)
@@ -181,12 +220,18 @@ def _index_one(
         }
 
     except Exception as e:
-        return {
+        payload: Dict[str, Any] = {
             "ok": False,
             "skipped_sample": False,
-            "error": str(e),
+            "error": f"{type(e).__name__}: {e}",
             "wav": str(wav_path),
         }
+        # ✅ Extra opcional: paths para diagnóstico
+        if out_json is not None:
+            payload["out_json"] = str(out_json.as_posix())
+        if export_path is not None:
+            payload["export_path"] = str(export_path.as_posix())
+        return payload
 
 
 def cmd_index(args) -> int:
