@@ -75,6 +75,10 @@ class App(tk.Tk):
         self.in_dir = tk.StringVar()
         self.out_dir = tk.StringVar()
 
+        # ✅ NUEVO: PRO (Index)
+        self.index_pro = tk.BooleanVar(value=False)      # o True si quieres default PRO
+        self.index_pro_wav_dir = tk.StringVar(value="")  # opcional
+
         # Vars Diag
         self.diag_wav = tk.StringVar()
         self.diag_out = tk.StringVar()
@@ -96,11 +100,19 @@ class App(tk.Tk):
         self.match_w_harm = tk.DoubleVar(value=1.0)
         self.match_w_eq = tk.DoubleVar(value=0.8)
 
+        # refs UI que necesitamos habilitar/deshabilitar
+        self._spin_table_size: Optional[ttk.Spinbox] = None
+        self._pro_wav_entry: Optional[ttk.Entry] = None
+        self._pro_wav_btn: Optional[ttk.Button] = None
+
         self._build_ui()
         self._setup_logging()
 
         # ✅ cierre limpio
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Aplica estado inicial PRO a la UI
+        self._apply_pro_ui_state()
 
         # Arranca polling de logs
         self._poll_logs()
@@ -115,8 +127,10 @@ class App(tk.Tk):
         opt.pack(fill="x", **pad)
 
         ttk.Label(opt, text="tableSize").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(opt, from_=256, to=8192, increment=256, textvariable=self.table_size, width=10)\
-            .grid(row=0, column=1, padx=6)
+        self._spin_table_size = ttk.Spinbox(
+            opt, from_=256, to=8192, increment=256, textvariable=self.table_size, width=10
+        )
+        self._spin_table_size.grid(row=0, column=1, padx=6)
 
         ttk.Label(opt, text="harmonics").grid(row=0, column=2, sticky="w")
         ttk.Spinbox(opt, from_=16, to=256, increment=16, textvariable=self.harmonics, width=10)\
@@ -181,6 +195,25 @@ class App(tk.Tk):
         ttk.Button(frm, text="Elegir...", command=self._pick_out).grid(row=1, column=2)
 
         frm.columnconfigure(1, weight=1)
+
+        # ✅ NUEVO: Modo PRO (Index)
+        profrm = ttk.LabelFrame(parent, text="Modo PRO (Index)")
+        profrm.pack(fill="x", **pad)
+
+        ttk.Checkbutton(
+            profrm,
+            text="Modo PRO (export 2048x64 PCM16)",
+            variable=self.index_pro,
+            command=self._apply_pro_ui_state
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+
+        ttk.Label(profrm, text="(Opcional) Carpeta export WAV canónicos:").grid(row=1, column=0, sticky="w", padx=6)
+        self._pro_wav_entry = ttk.Entry(profrm, textvariable=self.index_pro_wav_dir, width=64)
+        self._pro_wav_entry.grid(row=1, column=1, sticky="we", padx=6)
+        self._pro_wav_btn = ttk.Button(profrm, text="Elegir...", command=self._pick_pro_wav_dir)
+        self._pro_wav_btn.grid(row=1, column=2, padx=6)
+
+        profrm.columnconfigure(1, weight=1)
 
         runfrm = ttk.Frame(parent)
         runfrm.pack(fill="x", **pad)
@@ -289,6 +322,47 @@ class App(tk.Tk):
         self.btn_run_match.pack(side="left")
 
         ttk.Label(runfrm, text="Genera report JSON + .txt con filtros PEQ aproximados.").pack(side="left", padx=12)
+
+    # ✅ NUEVO: aplica estado PRO a UI + fuerza tableSize
+    def _apply_pro_ui_state(self):
+        pro = bool(self.index_pro.get())
+        if pro:
+            # fuerza idioma único
+            try:
+                self.table_size.set(2048)
+            except Exception:
+                pass
+
+            # deshabilita tableSize para evitar confusiones
+            if self._spin_table_size is not None:
+                try:
+                    self._spin_table_size.config(state="disabled")
+                except Exception:
+                    pass
+
+            # habilita pro_wav_dir
+            if self._pro_wav_entry is not None:
+                self._pro_wav_entry.config(state="normal")
+            if self._pro_wav_btn is not None:
+                self._pro_wav_btn.config(state="normal")
+        else:
+            # habilita tableSize
+            if self._spin_table_size is not None:
+                try:
+                    self._spin_table_size.config(state="normal")
+                except Exception:
+                    pass
+
+            # deshabilita pro_wav_dir (y opcionalmente limpia)
+            if self._pro_wav_entry is not None:
+                self._pro_wav_entry.config(state="disabled")
+            if self._pro_wav_btn is not None:
+                self._pro_wav_btn.config(state="disabled")
+
+    def _pick_pro_wav_dir(self):
+        p = filedialog.askdirectory(title="Elige carpeta para export WAV canónicos (PRO)")
+        if p:
+            self.index_pro_wav_dir.set(p)
 
     # ---------------- Logging ----------------
 
@@ -456,11 +530,20 @@ class App(tk.Tk):
         self._ensure_file_logger(out_p)
         self._set_running(True)
 
+        # Si PRO está activo, forzamos 2048 en UI y en args
+        pro = bool(self.index_pro.get())
+        if pro:
+            self.table_size.set(2048)
+
         ts, harm, bands = self._common_args()
         self.logger.info("== INDEX START ==")
         self.logger.info(f"Entrada: {in_p}")
         self.logger.info(f"Salida:  {out_p}")
         self.logger.info(f"Params: tableSize={ts} harmonics={harm} bands={bands}")
+        self.logger.info(f"PRO: {pro} (export 2048x64 PCM16)")
+
+        if pro and self.index_pro_wav_dir.get().strip():
+            self.logger.info(f"PRO wav dir: {self.index_pro_wav_dir.get().strip()}")
 
         th = threading.Thread(target=self._worker_index, args=(in_p, out_p, ts, harm, bands), daemon=True)
         th.start()
@@ -471,6 +554,14 @@ class App(tk.Tk):
                 self.logger.warning("Index cancelado antes de iniciar.")
                 return
 
+            pro = bool(self.index_pro.get())
+            if pro:
+                ts = 2048  # fuerza real por seguridad
+
+            pro_wav_dir = self.index_pro_wav_dir.get().strip()
+            if not pro_wav_dir:
+                pro_wav_dir = None  # que el CLI use default OUT/EXPORT/WAV
+
             args = SimpleNamespace(
                 in_dir=str(in_p),
                 out_dir=str(out_p),
@@ -478,6 +569,10 @@ class App(tk.Tk):
                 harmonics=int(harm),
                 bands=int(bands),
                 # no exponemos include_samples en UI Index (por defecto False).
+
+                # ✅ PRO flags hacia cmd_index (wtdiag-2)
+                pro=bool(pro),
+                pro_wav_dir=pro_wav_dir,
             )
 
             rc = wtdiag.cmd_index(args)
@@ -674,4 +769,3 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
-
