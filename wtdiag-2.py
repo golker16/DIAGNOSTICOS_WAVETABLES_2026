@@ -12,8 +12,9 @@ except ModuleNotFoundError:
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -45,6 +46,72 @@ FEATURE_SR = core.FEATURE_SR
 # Indexado
 # ----------------------------
 
+def _safe_descriptor_name(in_dir: Path, wav_path: Path) -> str:
+    rel = wav_path.relative_to(in_dir).as_posix()
+    safe = rel.replace("/", "__").replace("\\", "__")
+    return Path(safe).with_suffix(".json").name
+
+
+def _index_one(
+    wav_path: Path,
+    in_dir: Path,
+    out_dir: Path,
+    table_size: int,
+    harmonics: int,
+    bands: int,
+    include_samples: bool
+) -> Dict[str, Any]:
+    """
+    Worker para index en paralelo.
+    Devuelve dict con:
+      - ok: bool
+      - skipped_sample: bool
+      - out_json_name: str (si ok)
+      - entry: dict (si ok)
+      - error: str (si falla)
+      - wav: str
+    """
+    try:
+        desc = core.process_wavetable(wav_path, table_size, harmonics, bands)
+
+        # Evitar “contaminar” la DB con archivos no-wavetable
+        if desc.type == "sample" and not include_samples:
+            return {
+                "ok": False,
+                "skipped_sample": True,
+                "wav": str(wav_path),
+            }
+
+        out_name = _safe_descriptor_name(in_dir, wav_path)
+        out_json = out_dir / out_name
+
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
+
+        entry = {
+            "path": desc.path,
+            "descriptor": out_name,
+            "type": desc.type,
+            "family": desc.diagnosis.family,
+            "best_for": desc.diagnosis.best_for,
+        }
+        return {
+            "ok": True,
+            "skipped_sample": False,
+            "out_json_name": out_name,
+            "entry": entry,
+            "wav": str(wav_path),
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "skipped_sample": False,
+            "error": str(e),
+            "wav": str(wav_path),
+        }
+
+
 def cmd_index(args) -> int:
     in_dir = Path(args.in_dir)
     out_dir = Path(args.out_dir)
@@ -56,59 +123,110 @@ def cmd_index(args) -> int:
         return 2
 
     include_samples = bool(getattr(args, "include_samples", False))
+    jobs = int(getattr(args, "jobs", 1) or 1)
+    jobs = max(1, jobs)
 
-    db_entries: List[Dict[str, Any]] = []
+    processed = 0
     kept = 0
     skipped_samples = 0
+    failed_files = 0
 
-    for i, p in enumerate(wavs, 1):
-        try:
-            desc = core.process_wavetable(p, args.table_size, args.harmonics, args.bands)
+    db_entries: List[Dict[str, Any]] = []
 
-            # NUEVO: evitar “contaminar” la DB con archivos no-wavetable
-            # type="sample" (antes era unknown)
-            if desc.type == "sample" and not include_samples:
+    def _progress(i_done: int):
+        if i_done % 50 == 0 or i_done == len(wavs):
+            print(
+                f"[index] {i_done}/{len(wavs)} ... "
+                f"(kept={kept}, failed={failed_files}, skipped_samples={skipped_samples})"
+            )
+
+    if jobs == 1:
+        for i, p in enumerate(wavs, 1):
+            processed += 1
+            res = _index_one(
+                wav_path=p,
+                in_dir=in_dir,
+                out_dir=out_dir,
+                table_size=int(args.table_size),
+                harmonics=int(args.harmonics),
+                bands=int(args.bands),
+                include_samples=include_samples,
+            )
+
+            if res.get("skipped_sample"):
                 skipped_samples += 1
-                continue
+            elif res.get("ok"):
+                db_entries.append(res["entry"])
+                kept += 1
+            else:
+                failed_files += 1
+                print(f"[index] ERROR en {p}: {res.get('error', 'error desconocido')}")
 
-            rel = p.relative_to(in_dir).as_posix()
-            safe = rel.replace("/", "__").replace("\\", "__")
-            out_json = out_dir / (Path(safe).with_suffix(".json").name)
+            _progress(i)
 
-            with open(out_json, "w", encoding="utf-8") as f:
-                json.dump(core.descriptor_to_spec(desc), f, ensure_ascii=False, indent=2)
+    else:
+        # Paralelo: el trabajo pesado está en numpy/scipy; threads ayudan.
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = [
+                ex.submit(
+                    _index_one,
+                    p, in_dir, out_dir,
+                    int(args.table_size), int(args.harmonics), int(args.bands),
+                    include_samples
+                )
+                for p in wavs
+            ]
 
-            db_entries.append({
-                "path": desc.path,
-                "descriptor": out_json.name,
-                "type": desc.type,
-                "family": desc.diagnosis.family,
-                "best_for": desc.diagnosis.best_for
-            })
-            kept += 1
+            done = 0
+            for fut in as_completed(futures):
+                processed += 1
+                done += 1
+                res = fut.result()
 
-            if i % 50 == 0:
-                print(f"[index] {i}/{len(wavs)} ... (kept={kept}, skipped_samples={skipped_samples})")
-        except Exception as e:
-            print(f"[index] ERROR en {p}: {e}")
+                if res.get("skipped_sample"):
+                    skipped_samples += 1
+                elif res.get("ok"):
+                    db_entries.append(res["entry"])
+                    kept += 1
+                else:
+                    failed_files += 1
+                    print(f"[index] ERROR en {res.get('wav', '(wav?)')}: {res.get('error', 'error desconocido')}")
+
+                _progress(done)
+
+    # Mantener orden estable en entries (por nombre descriptor)
+    db_entries.sort(key=lambda e: str(e.get("descriptor", "")))
 
     index = {
         "tableSize": int(args.table_size),
         "harmonics": int(args.harmonics),
         "bands": int(args.bands),
-        "count": len(db_entries),
+        "feature_sr": int(core.FEATURE_SR),
+        "count": int(len(db_entries)),
+        "processed": int(len(wavs)),
+        "kept": int(kept),
+        "failed_files": int(failed_files),
         "skipped_samples": int(skipped_samples),
         "include_samples": bool(include_samples),
-        "entries": db_entries
+        "jobs": int(jobs),
+        "entries": db_entries,
     }
 
     with open(out_dir / "_INDEX.json", "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
 
-    msg = f"[index] OK. Descriptores: {len(db_entries)} en {out_dir}"
-    if skipped_samples and not include_samples:
-        msg += f" (skipped_samples={skipped_samples})"
-    print(msg)
+    # Resumen final (antes solo decía OK)
+    print(
+        "[index] DONE\n"
+        f"  in_dir:          {in_dir}\n"
+        f"  out_dir:         {out_dir}\n"
+        f"  processed:       {len(wavs)}\n"
+        f"  kept:            {kept}\n"
+        f"  failed_files:    {failed_files}\n"
+        f"  skipped_samples: {skipped_samples} (include_samples={include_samples})\n"
+        f"  params:          tableSize={int(args.table_size)} harmonics={int(args.harmonics)} bands={int(args.bands)} feature_sr={int(core.FEATURE_SR)}\n"
+        f"  jobs:            {jobs}"
+    )
     return 0
 
 
@@ -140,6 +258,48 @@ def _get_arg(args, name: str, default):
     return getattr(args, name, default)
 
 
+def _compat_warning(index_meta: Dict[str, Any], args) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Compara parámetros de index vs parámetros actuales del match.
+    Devuelve: (mismatch, warning_str, compat_obj)
+    """
+    idx_ts = int(index_meta.get("tableSize", -1))
+    idx_h = int(index_meta.get("harmonics", -1))
+    idx_b = int(index_meta.get("bands", -1))
+    idx_fs = index_meta.get("feature_sr", None)
+
+    req_ts = int(getattr(args, "table_size", -1))
+    req_h = int(getattr(args, "harmonics", -1))
+    req_b = int(getattr(args, "bands", -1))
+    req_fs = int(core.FEATURE_SR)
+
+    mismatch = (idx_ts != req_ts) or (idx_h != req_h) or (idx_b != req_b)
+    # feature_sr: si viene en index, también comparamos
+    if idx_fs is not None:
+        try:
+            mismatch = mismatch or (int(idx_fs) != req_fs)
+        except Exception:
+            mismatch = True
+
+    compat_obj = {
+        "indexed": {"tableSize": idx_ts, "harmonics": idx_h, "bands": idx_b, "feature_sr": idx_fs},
+        "requested": {"tableSize": req_ts, "harmonics": req_h, "bands": req_b, "feature_sr": req_fs},
+        "mismatch": bool(mismatch),
+    }
+
+    if mismatch:
+        warning = (
+            "WARNING: Tu DB fue indexada con parámetros distintos a los del match.\n"
+            f"  DB(index): tableSize={idx_ts}, harmonics={idx_h}, bands={idx_b}, feature_sr={idx_fs}\n"
+            f"  Match:     tableSize={req_ts}, harmonics={req_h}, bands={req_b}, feature_sr={req_fs}\n"
+            "  Esto puede producir resultados raros. Recomendación: reindexa la DB con los mismos parámetros."
+        )
+    else:
+        warning = ""
+
+    return mismatch, warning, compat_obj
+
+
 def cmd_match(args) -> int:
     db_dir = Path(_get_arg(args, "db_dir", _get_arg(args, "db", "")))
     index_path = db_dir / "_INDEX.json"
@@ -154,6 +314,20 @@ def cmd_match(args) -> int:
 
     out_path = Path(_get_arg(args, "out", "match_report.json"))
 
+    # Cargar index y verificar compat
+    with open(index_path, "r", encoding="utf-8") as f:
+        idx = json.load(f)
+
+    mismatch, warning, compat_obj = _compat_warning(idx, args)
+    if warning:
+        print(warning)
+
+    entries = idx.get("entries", [])
+    if not entries:
+        print("[match] Índice vacío.")
+        return 2
+
+    # Preparar target
     tx, _tsr = core.safe_read_wav(target_path)
     tx = core.standardize_audio(tx)
 
@@ -165,43 +339,63 @@ def cmd_match(args) -> int:
     th = np.array(tfeat.harmonics, dtype=np.float32)
     tenv = np.array(tfeat.spectral_env_db, dtype=np.float32)
 
-    with open(index_path, "r", encoding="utf-8") as f:
-        idx = json.load(f)
-
-    entries = idx.get("entries", [])
-    if not entries:
-        print("[match] Índice vacío.")
-        return 2
-
     topk = int(_get_arg(args, "topk", 50))
     topn = int(_get_arg(args, "topn", 10))
     include_samples = bool(_get_arg(args, "include_samples", False))
     gain_mode = str(_get_arg(args, "gain_mode", "rms")).lower()
     gain_mode = "lufs" if gain_mode == "lufs" else "rms"
 
+    # Contadores de calidad / skips (ANTES: se ignoraba silenciosamente)
+    counters = {
+        "entries_total": int(len(entries)),
+        "descriptor_loaded_ok": 0,
+        "skipped_samples": 0,
+        "skipped_bad_json": 0,
+        "skipped_schema": 0,
+        "skipped_compat": 0,   # feature_sr mismatch u otras incompatibilidades
+        "skipped_features": 0,
+        "other_errors": 0,
+    }
+
     # 1) Top-K por armónicos (ADN)
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for ent in entries:
-        dpath = db_dir / ent["descriptor"]
+        dpath = db_dir / ent.get("descriptor", "")
         try:
             desc = core.load_descriptor(dpath)
-        except Exception:
+            counters["descriptor_loaded_ok"] += 1
+        except Exception as e:
+            msg = str(e).lower()
+            # Heurística simple para clasificar el motivo
+            if "json" in msg and ("invál" in msg or "inval" in msg or "decode" in msg):
+                counters["skipped_bad_json"] += 1
+            elif "feature_sr" in msg or "reindex" in msg or "parámetros" in msg or "parametros" in msg:
+                counters["skipped_compat"] += 1
+            elif "falta key" in msg or "schema" in msg or "features" in msg or "descriptor" in msg:
+                counters["skipped_schema"] += 1
+            else:
+                counters["other_errors"] += 1
             continue
 
-        # NUEVO: el tipo “no wavetable” ahora es sample
+        # tipo “no wavetable” ahora es sample
         if desc.get("type") == "sample" and not include_samples:
+            counters["skipped_samples"] += 1
             continue
 
         try:
             h, _e, _r, _l = core.get_desc_features(desc)
         except Exception:
+            counters["skipped_features"] += 1
             continue
 
         ch = np.array(h, dtype=np.float32)
         scored.append((core.cosine_distance(th, ch), desc))
 
     if not scored:
-        print("[match] No hay candidatos tras filtros.")
+        print(
+            "[match] No hay candidatos tras filtros.\n"
+            f"  summary: {counters}"
+        )
         return 2
 
     scored.sort(key=lambda t: t[0])
@@ -219,6 +413,12 @@ def cmd_match(args) -> int:
     for harm_err, desc in top:
         _h, e, r, l = core.get_desc_features(desc)
         cand_env = np.array(e, dtype=np.float32)
+
+        # Si por alguna razón bands difieren (mismatch), igual intentamos,
+        # pero si longitudes no coinciden, skip (mejor que romper)
+        if cand_env.shape != tenv.shape:
+            counters["skipped_compat"] += 1
+            continue
 
         delta = tenv - cand_env
         delta = core.smooth_and_limit_delta(delta, limit_db=eq_limit_db, smooth_sigma=eq_smooth)
@@ -252,6 +452,13 @@ def cmd_match(args) -> int:
             "diagnosis": desc.get("diagnosis", {})
         })
 
+    if not results:
+        print(
+            "[match] No hay resultados tras refinamiento (posible mismatch bands o filtros).\n"
+            f"  summary: {counters}"
+        )
+        return 2
+
     results.sort(key=lambda r: r["score"])
     results = results[: max(1, topn)]
 
@@ -260,10 +467,14 @@ def cmd_match(args) -> int:
         suggestions.append("Target tiene bastante componente ruidosa: considera capa de noise/attack residual.")
     if tfeat.brightness > 0.7:
         suggestions.append("Target muy brillante: limita stacks o aplica lowpass suave en capas auxiliares.")
+    if mismatch:
+        suggestions.append("DB/Match con parámetros distintos: reindexar DB para resultados más confiables.")
 
     report: Dict[str, Any] = {
         "target": str(target_path.as_posix()),
         "target_selection": {"method": "stable_segment", "tableSize": int(args.table_size)},
+        "db_compat": compat_obj,
+        "summary": counters,  # ✅ guardamos contadores en el JSON
         "target_features": {
             "tonalness": tfeat.tonalness,
             "noise_ratio_db": tfeat.noise_ratio_db,
@@ -295,13 +506,31 @@ def cmd_match(args) -> int:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    # TXT legible
+    # TXT legible (+ resumen de skips)
     txt_path = out_path.with_suffix(".txt")
     lines: List[str] = []
     lines.append("WAVETABLE MATCH REPORT")
     lines.append(f"Target: {report['target']}")
     lines.append(f"Gain mode: {'lufs' if gain_mode=='lufs' else 'rms_dbfs'}")
     lines.append("")
+    lines.append("SUMMARY:")
+    for k in (
+        "entries_total",
+        "descriptor_loaded_ok",
+        "skipped_bad_json",
+        "skipped_schema",
+        "skipped_compat",
+        "skipped_features",
+        "skipped_samples",
+        "other_errors",
+    ):
+        lines.append(f" - {k}: {counters.get(k)}")
+    lines.append("")
+
+    if mismatch:
+        lines.append("DB PARAM WARNING:")
+        lines.append(warning)
+        lines.append("")
 
     if suggestions:
         lines.append("SUGERENCIAS:")
@@ -335,6 +564,8 @@ def cmd_match(args) -> int:
         f.write("\n".join(lines))
 
     print(f"[match] OK -> {out_path} (+ {txt_path.name})")
+    # ✅ print resumen visible en consola
+    print(f"[match] summary: {counters}")
     return 0
 
 
@@ -358,6 +589,14 @@ def main():
         "--include-samples",
         action="store_true",
         help="Incluye type='sample' (archivos no-wavetable)"
+    )
+
+    # ✅ NUEVO: paralelización opcional
+    p_index.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Número de workers para index paralelo (default=1)."
     )
 
     p_index.set_defaults(func=cmd_index)
