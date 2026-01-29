@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Optional
 from types import SimpleNamespace
 
+# ✅ NUEVO: capturar stdout/stderr del motor (print())
+import io
+import contextlib
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -325,13 +329,15 @@ class App(tk.Tk):
 
     def _setup_logging(self):
         self.logger = logging.getLogger("wtgui")
-        self.logger.setLevel(logging.INFO)
+        # ✅ CAMBIO: DEBUG global
+        self.logger.setLevel(logging.DEBUG)
         self.logger.handlers.clear()
 
         fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
         ui_handler = TkTextHandler(self.log_queue)
         ui_handler.setFormatter(fmt)
+        # (no fijamos nivel del handler -> hereda DEBUG del logger)
         self.logger.addHandler(ui_handler)
 
     def _ensure_file_logger(self, out_dir: Path):
@@ -342,9 +348,27 @@ class App(tk.Tk):
 
         out_dir.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(out_dir / "wt_gui.log", encoding="utf-8")
-        fh.setLevel(logging.INFO)
+        # ✅ CAMBIO: DEBUG a archivo
+        fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         self.logger.addHandler(fh)
+
+    # ✅ NUEVO: capturar print() del motor y mandarlo a la GUI + log file
+    def _run_with_captured_stdio(self, fn, *args, **kwargs):
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = fn(*args, **kwargs)
+
+        out = buf_out.getvalue().splitlines()
+        err = buf_err.getvalue().splitlines()
+
+        for line in out:
+            self.logger.info(f"[ENGINE] {line}")
+        for line in err:
+            self.logger.error(f"[ENGINE:stderr] {line}")
+
+        return rc
 
     # ---------------- Pickers ----------------
 
@@ -520,9 +544,34 @@ class App(tk.Tk):
                 # NO pro_wav_dir (ya no existe)
             )
 
-            rc = wtdiag.cmd_index(args)
+            # ✅ CAMBIO: capturar print() del motor
+            rc = self._run_with_captured_stdio(wtdiag.cmd_index, args)
+
             if self.cancel_requested:
                 self.logger.warning("Index terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
+
+            # ✅ NUEVO: resumen real de outputs en carpeta
+            try:
+                jsons = list(out_p.glob("*.json"))
+                wavs = list(out_p.glob("*.wav"))
+                self.logger.info(f"Outputs en {out_p}: json={len(jsons)} wav={len(wavs)}")
+            except Exception as e:
+                self.logger.debug(f"No pude contar outputs: {type(e).__name__}: {e}")
+
+            # ✅ NUEVO (opcional): leer _INDEX.json y reportar kept/failed/skipped
+            try:
+                idx_path = out_p / "_INDEX.json"
+                if idx_path.exists():
+                    import json as _json_stdlib
+                    with open(idx_path, "r", encoding="utf-8") as f:
+                        idx = _json_stdlib.load(f)
+                    self.logger.info(
+                        "INDEX summary: "
+                        f"kept={idx.get('kept')} failed_files={idx.get('failed_files')} "
+                        f"skipped_samples={idx.get('skipped_samples')} processed={idx.get('processed')}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"No pude leer _INDEX.json: {type(e).__name__}: {e}")
 
             if rc == 0:
                 self.logger.info("Indexado OK. Se generó _INDEX.json y WAV/JSON __CAN.")
@@ -580,7 +629,9 @@ class App(tk.Tk):
                 bands=int(bands),
             )
 
-            rc = wtdiag.cmd_diag(args)
+            # ✅ CAMBIO: capturar print() del motor
+            rc = self._run_with_captured_stdio(wtdiag.cmd_diag, args)
+
             if self.cancel_requested:
                 self.logger.warning("Diag terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
 
@@ -675,7 +726,8 @@ class App(tk.Tk):
                 w_eq=float(self.match_w_eq.get()),
             )
 
-            rc = wtdiag.cmd_match(args)
+            # ✅ CAMBIO: capturar print() del motor
+            rc = self._run_with_captured_stdio(wtdiag.cmd_match, args)
 
             if self.cancel_requested:
                 self.logger.warning("Match terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
