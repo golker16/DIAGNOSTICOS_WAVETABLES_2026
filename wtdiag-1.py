@@ -62,9 +62,39 @@ def normalize_peak(x: np.ndarray, target_peak: float = TARGET_PEAK) -> np.ndarra
     return x * (target_peak / p)
 
 def safe_read_wav(path: Path) -> Tuple[np.ndarray, int]:
-    x, sr = sf.read(str(path), always_2d=False)
-    x = to_mono(np.asarray(x, dtype=np.float32))
-    return x, int(sr)
+    """
+    Lee WAV de forma robusta y devuelve (audio_mono_float32, sr).
+    Lanza ValueError/IOError con mensajes claros si el archivo es inválido.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"No existe el WAV: {p}")
+    if not p.is_file():
+        raise IsADirectoryError(f"No es un archivo WAV: {p}")
+
+    try:
+        x, sr = sf.read(str(p), always_2d=False)
+    except Exception as e:
+        raise IOError(f"No pude leer WAV '{p}': {e}") from e
+
+    if sr is None:
+        raise ValueError(f"WAV '{p}': sampleRate inválido (None).")
+    sr_i = int(sr)
+
+    # Rangos típicos para evitar basura/errores (no bloquea casos raros, pero atrapa cosas rotas)
+    if sr_i < 4000 or sr_i > 384000:
+        raise ValueError(f"WAV '{p}': sampleRate sospechoso: {sr_i} Hz")
+
+    x = np.asarray(x, dtype=np.float32)
+    x = to_mono(x)
+
+    if x.size == 0:
+        raise ValueError(f"WAV '{p}': audio vacío.")
+    if not np.isfinite(x).all():
+        # Mejor fallar temprano: NaN/Inf rompe DSP, features y matching.
+        raise ValueError(f"WAV '{p}': contiene NaN/Inf (audio corrupto o conversión inválida).")
+
+    return x, sr_i
 
 def ensure_len(x: np.ndarray, n: int) -> np.ndarray:
     if len(x) == n:
@@ -808,10 +838,17 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
     Convierte delta_env_db (en bandas log) a una lista de filtros paramétricos aproximados:
       - low_shelf / high_shelf (para "tilt" global)
       - peaking con Q variable (según ancho del pico/valle)
+
+    Robusto ante datos patológicos: NaN/Inf, pocos puntos válidos, polyfit inestable.
     """
-    d = np.array(delta_db, dtype=np.float32)
-    n = len(d)
+    d = np.asarray(delta_db, dtype=np.float32).copy()
+    n = int(d.size)
     if n < 8 or max_filters <= 0:
+        return []
+
+    # Si viene basura (NaN/Inf), usamos solo los puntos finitos.
+    finite = np.isfinite(d)
+    if not bool(np.any(finite)):
         return []
 
     centers = bands_centers_hz(sr, n)
@@ -819,36 +856,55 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
 
     filters: List[Dict[str, float]] = []
 
-    # 1) Tilt global: fit delta ~ a*logf + b
-    a, b = np.polyfit(logf, d.astype(np.float64), 1)
-    a = float(a)
-    b = float(b)
-
-    pred = (a * logf + b).astype(np.float32)
-    tilt_gain = float(pred[-1] - pred[0])  # dB high - low (aprox)
-
+    # 1) Tilt global: fit delta ~ a*logf + b (solo puntos válidos)
+    #    Si no hay suficientes puntos o polyfit falla, se salta el tilt.
     TILT_THR_DB = 3.0
+    MAX_SHELF_GAIN_DB = 12.0  # límite extra (además del clip previo del delta)
     residual = d.copy()
 
-    if abs(tilt_gain) >= TILT_THR_DB and max_filters >= 1:
-        if tilt_gain > 0:
-            f0 = float(centers[int(np.clip(int(0.60 * (n - 1)), 0, n - 1))])
-            filters.append({"type": "high_shelf", "f0_hz": f0, "gain_db": float(tilt_gain), "slope": 1.0})
-        else:
-            f0 = float(centers[int(np.clip(int(0.40 * (n - 1)), 0, n - 1))])
-            filters.append({"type": "low_shelf", "f0_hz": f0, "gain_db": float(abs(tilt_gain)), "slope": 1.0})
+    valid_idx = np.where(finite)[0]
+    if valid_idx.size >= 6:
+        try:
+            a, b = np.polyfit(logf[valid_idx].astype(np.float64), d[valid_idx].astype(np.float64), 1)
+            a = float(a)
+            b = float(b)
+            pred = (a * logf + b).astype(np.float32)
 
-        residual = (d - pred).astype(np.float32)
+            # dB high - low (aprox). Usa extremos finitos si existen, si no extremos del vector.
+            lo_i = int(valid_idx[0])
+            hi_i = int(valid_idx[-1])
+            tilt_gain = float(pred[hi_i] - pred[lo_i])
+
+            # Evita valores absurdos por ajustes raros
+            tilt_gain = float(np.clip(tilt_gain, -MAX_SHELF_GAIN_DB, MAX_SHELF_GAIN_DB))
+
+            if abs(tilt_gain) >= TILT_THR_DB and max_filters >= 1:
+                if tilt_gain > 0:
+                    f0 = float(centers[int(np.clip(int(0.60 * (n - 1)), 0, n - 1))])
+                    filters.append({"type": "high_shelf", "f0_hz": f0, "gain_db": tilt_gain, "slope": 1.0})
+                else:
+                    f0 = float(centers[int(np.clip(int(0.40 * (n - 1)), 0, n - 1))])
+                    filters.append({"type": "low_shelf", "f0_hz": f0, "gain_db": float(abs(tilt_gain)), "slope": 1.0})
+
+                residual = (d - pred).astype(np.float32)
+        except Exception:
+            # polyfit puede fallar si hay degeneración numérica; no pasa nada, seguimos sin tilt.
+            pass
 
     remaining = max(0, max_filters - len(filters))
     if remaining <= 0:
         return filters
 
+    # 2) Picos/valleys en residual
     MIN_PROM_DB = 1.0
     MIN_GAIN_DB = 0.8
+    MAX_PEAK_GAIN_DB = 12.0  # límite extra
 
-    peaks, props_p = find_peaks(residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
-    valleys, props_v = find_peaks(-residual, prominence=MIN_PROM_DB, distance=max(1, min_sep_bands))
+    # Asegura finitud en residual para find_peaks
+    residual = np.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    peaks, props_p = find_peaks(residual, prominence=MIN_PROM_DB, distance=max(1, int(min_sep_bands)))
+    valleys, props_v = find_peaks(-residual, prominence=MIN_PROM_DB, distance=max(1, int(min_sep_bands)))
 
     candidates: List[Tuple[float, int, str, float]] = []
     for i, p in enumerate(peaks):
@@ -881,20 +937,28 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
         if abs(gain) < MIN_GAIN_DB:
             continue
 
-        if gain >= 0:
-            w_res = peak_widths(residual, peaks=np.array([idx]), rel_height=0.5)
-        else:
-            w_res = peak_widths(-residual, peaks=np.array([idx]), rel_height=0.5)
+        # límite adicional
+        gain = float(np.clip(gain, -MAX_PEAK_GAIN_DB, MAX_PEAK_GAIN_DB))
 
-        left_ip = float(w_res[2][0])   # left_ips
-        right_ip = float(w_res[3][0])  # right_ips
+        try:
+            if gain >= 0:
+                w_res = peak_widths(residual, peaks=np.array([idx]), rel_height=0.5)
+            else:
+                w_res = peak_widths(-residual, peaks=np.array([idx]), rel_height=0.5)
 
-        f0 = float(centers[idx])
-        f_left = _interp_center_freq(centers, left_ip)
-        f_right = _interp_center_freq(centers, right_ip)
-        bw = max(1e-3, float(abs(f_right - f_left)))
+            left_ip = float(w_res[2][0])   # left_ips
+            right_ip = float(w_res[3][0])  # right_ips
 
-        q = float(np.clip(f0 / bw, 0.3, 12.0))
+            f0 = float(centers[idx])
+            f_left = _interp_center_freq(centers, left_ip)
+            f_right = _interp_center_freq(centers, right_ip)
+            bw = max(1e-3, float(abs(f_right - f_left)))
+
+            q = float(np.clip(f0 / bw, 0.3, 12.0))
+        except Exception:
+            # Fallback razonable
+            f0 = float(centers[idx])
+            q = 1.2
 
         filters.append({"type": "peaking", "f0_hz": f0, "gain_db": gain, "q": q})
 
@@ -904,6 +968,75 @@ def delta_to_peq(delta_db: np.ndarray, sr: int, max_filters: int = 6, min_sep_ba
     return filters[:max_filters]
 
 def load_descriptor(path: Path) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """
+    Carga descriptor JSON con validaciones mínimas + checks de compatibilidad.
+
+    - Valida que el JSON sea parseable y tenga un schema mínimo.
+    - Verifica feature_sr (si existe) contra FEATURE_SR del motor:
+        si no coincide -> se ignora (lanza ValueError) para evitar matches raros.
+    - Valida que harmonics/env sean listas numéricas y finitas.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"No existe descriptor: {p}")
+    if not p.is_file():
+        raise IsADirectoryError(f"No es un archivo descriptor: {p}")
+
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            desc = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Descriptor JSON inválido '{p}': {e}") from e
+    except Exception as e:
+        raise IOError(f"No pude leer descriptor '{p}': {e}") from e
+
+    if not isinstance(desc, dict):
+        raise ValueError(f"Descriptor '{p}': el JSON raíz debe ser un objeto/dict.")
+
+    # --- schema mínimo ---
+    for k in ("type", "tableSize"):
+        if k not in desc:
+            raise ValueError(f"Descriptor '{p}': falta key obligatoria '{k}'.")
+
+    # Compat-check: SR canónico usado para mapear bandas
+    fs = desc.get("feature_sr", None)
+    if fs is not None:
+        try:
+            fs_i = int(fs)
+        except Exception:
+            raise ValueError(f"Descriptor '{p}': feature_sr inválido: {fs!r}")
+        if fs_i != int(FEATURE_SR):
+            raise ValueError(
+                f"Descriptor '{p}': feature_sr={fs_i} != FEATURE_SR={FEATURE_SR}. "
+                "Reindexa la DB con los mismos parámetros."
+            )
+
+    # Extrae features (soporta spec nuevo y compat viejo)
+    try:
+        h, e, r, l = get_desc_features(desc)
+    except Exception as ex:
+        raise ValueError(f"Descriptor '{p}': no pude extraer features: {ex}") from ex
+
+    # Validaciones de tipo/longitud
+    if not isinstance(h, list) or not isinstance(e, list):
+        raise ValueError(f"Descriptor '{p}': harmonics/env deben ser listas.")
+    if len(h) < 8 or len(e) < 8:
+        raise ValueError(f"Descriptor '{p}': harmonics/env demasiado cortos (h={len(h)}, env={len(e)}).")
+
+    # Validaciones numéricas
+    h_np = np.asarray(h, dtype=np.float32)
+    e_np = np.asarray(e, dtype=np.float32)
+
+    if not np.isfinite(h_np).all() or not np.isfinite(e_np).all():
+        raise ValueError(f"Descriptor '{p}': harmonics/env contienen NaN/Inf.")
+
+    # Validación ligera de ganancia (evita strings/None)
+    try:
+        _ = float(r)
+        _ = float(l)
+    except Exception:
+        raise ValueError(f"Descriptor '{p}': rms_dbfs/lufs inválidos (no numéricos).")
+
+    return desc
+
 
