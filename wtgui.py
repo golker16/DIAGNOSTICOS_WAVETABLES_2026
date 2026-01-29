@@ -6,8 +6,8 @@ import os
 import sys
 import subprocess
 from pathlib import Path
-from typing import Optional  # <-- FIX
-from types import SimpleNamespace  # <-- FIX: para crear args tipo argparse
+from typing import Optional
+from types import SimpleNamespace
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -41,21 +41,28 @@ def open_in_file_manager(path: Path):
         else:
             subprocess.run(["xdg-open", p], check=False)
     except Exception:
-        # fallback: abrir carpeta contenedora
         parent = str(path if path.is_dir() else path.parent)
-        if sys.platform.startswith("win"):
-            os.startfile(parent)  # noqa
-        elif sys.platform == "darwin":
-            subprocess.run(["open", parent], check=False)
-        else:
-            subprocess.run(["xdg-open", parent], check=False)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(parent)  # noqa
+            elif sys.platform == "darwin":
+                subprocess.run(["open", parent], check=False)
+            else:
+                subprocess.run(["xdg-open", parent], check=False)
+        except Exception:
+            pass
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WT Diagnoser - Offline")
-        self.geometry("980x700")
+        self.geometry("980x740")
+
+        # Flags de cierre/cancelación
+        self._closing = False
+        self._poll_after_id = None
+        self.cancel_requested = False
 
         self.log_queue = queue.Queue()
 
@@ -72,7 +79,7 @@ class App(tk.Tk):
         self.diag_wav = tk.StringVar()
         self.diag_out = tk.StringVar()
 
-        # Vars Match
+        # Vars Match (existentes)
         self.match_db = tk.StringVar()
         self.match_target = tk.StringVar()
         self.match_out = tk.StringVar()
@@ -81,8 +88,21 @@ class App(tk.Tk):
         self.match_eq_smooth = tk.DoubleVar(value=1.5)
         self.match_include_samples = tk.BooleanVar(value=False)
 
+        # ✅ NUEVO: parámetros importantes del match (UI)
+        self.match_topn = tk.IntVar(value=10)
+        self.match_gain_mode = tk.StringVar(value="rms")  # "rms" | "lufs"
+        self.match_max_filters = tk.IntVar(value=6)
+        self.match_min_sep_bands = tk.IntVar(value=6)
+        self.match_w_harm = tk.DoubleVar(value=1.0)
+        self.match_w_eq = tk.DoubleVar(value=0.8)
+
         self._build_ui()
         self._setup_logging()
+
+        # ✅ cierre limpio
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Arranca polling de logs
         self._poll_logs()
 
     # ---------------- UI ----------------
@@ -130,6 +150,10 @@ class App(tk.Tk):
 
         self.btn_open_output = ttk.Button(act, text="Abrir salida (según tab)", command=self._open_current_output)
         self.btn_open_output.pack(side="left")
+
+        # ✅ NUEVO: botón Cancel
+        self.btn_cancel = ttk.Button(act, text="Cancelar", command=self._request_cancel, state="disabled")
+        self.btn_cancel.pack(side="left", padx=10)
 
         self.progress = ttk.Progressbar(act, mode="indeterminate")
         self.progress.pack(side="right", fill="x", expand=True)
@@ -214,23 +238,49 @@ class App(tk.Tk):
         opts = ttk.LabelFrame(parent, text="Parámetros Match")
         opts.pack(fill="x", **pad)
 
+        # Row 0
         ttk.Label(opts, text="topK").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(opts, from_=3, to=100, increment=1, textvariable=self.match_topk, width=10)\
+        ttk.Spinbox(opts, from_=3, to=200, increment=1, textvariable=self.match_topk, width=10)\
             .grid(row=0, column=1, padx=6)
 
-        ttk.Label(opts, text="EQ limit (dB)").grid(row=0, column=2, sticky="w")
-        ttk.Spinbox(opts, from_=1.0, to=18.0, increment=0.5, textvariable=self.match_eq_limit, width=10)\
+        ttk.Label(opts, text="topN").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(opts, from_=1, to=50, increment=1, textvariable=self.match_topn, width=10)\
             .grid(row=0, column=3, padx=6)
 
-        ttk.Label(opts, text="EQ smooth").grid(row=0, column=4, sticky="w")
-        ttk.Spinbox(opts, from_=0.2, to=6.0, increment=0.1, textvariable=self.match_eq_smooth, width=10)\
+        ttk.Label(opts, text="Gain mode").grid(row=0, column=4, sticky="w")
+        ttk.Combobox(opts, textvariable=self.match_gain_mode, values=["rms", "lufs"], width=8, state="readonly")\
             .grid(row=0, column=5, padx=6)
 
-        # Label CONSISTENTE con el motor/CLI:
         ttk.Checkbutton(opts, text="Include samples (type=sample)", variable=self.match_include_samples)\
             .grid(row=0, column=6, padx=10, sticky="w")
 
-        opts.columnconfigure(7, weight=1)
+        # Row 1
+        ttk.Label(opts, text="EQ limit (dB)").grid(row=1, column=0, sticky="w")
+        ttk.Spinbox(opts, from_=1.0, to=18.0, increment=0.5, textvariable=self.match_eq_limit, width=10)\
+            .grid(row=1, column=1, padx=6)
+
+        ttk.Label(opts, text="EQ smooth").grid(row=1, column=2, sticky="w")
+        ttk.Spinbox(opts, from_=0.2, to=6.0, increment=0.1, textvariable=self.match_eq_smooth, width=10)\
+            .grid(row=1, column=3, padx=6)
+
+        ttk.Label(opts, text="maxFilters").grid(row=1, column=4, sticky="w")
+        ttk.Spinbox(opts, from_=0, to=20, increment=1, textvariable=self.match_max_filters, width=10)\
+            .grid(row=1, column=5, padx=6)
+
+        ttk.Label(opts, text="minSepBands").grid(row=1, column=6, sticky="w")
+        ttk.Spinbox(opts, from_=1, to=32, increment=1, textvariable=self.match_min_sep_bands, width=10)\
+            .grid(row=1, column=7, padx=6)
+
+        # Row 2
+        ttk.Label(opts, text="w_harm").grid(row=2, column=0, sticky="w")
+        ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.1, textvariable=self.match_w_harm, width=10)\
+            .grid(row=2, column=1, padx=6)
+
+        ttk.Label(opts, text="w_eq").grid(row=2, column=2, sticky="w")
+        ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.1, textvariable=self.match_w_eq, width=10)\
+            .grid(row=2, column=3, padx=6)
+
+        opts.columnconfigure(8, weight=1)
 
         runfrm = ttk.Frame(parent)
         runfrm.pack(fill="x", **pad)
@@ -322,6 +372,31 @@ class App(tk.Tk):
 
     # ---------------- Helpers ----------------
 
+    def _on_close(self):
+        """✅ Cierre limpio: cancela after() del polling y destruye la ventana."""
+        self._closing = True
+        try:
+            if self._poll_after_id is not None:
+                self.after_cancel(self._poll_after_id)
+                self._poll_after_id = None
+        except Exception:
+            pass
+
+        # si hay tarea corriendo, marca cancel solicitado (no mata thread, pero queda registrado)
+        if getattr(self.btn_cancel, "state", None) != "disabled":
+            self.cancel_requested = True
+
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _request_cancel(self):
+        """✅ Cancelación suave: marca flag y el worker lo registra/checkea por etapas."""
+        if not self.cancel_requested:
+            self.cancel_requested = True
+            self.logger.warning("CANCEL REQUESTED: se intentará detener al terminar la etapa actual.")
+
     def _current_output_path(self) -> Optional[Path]:
         tab = self.nb.index("current")
         if tab == 0:
@@ -352,6 +427,10 @@ class App(tk.Tk):
         self.btn_run_index.config(state=state)
         self.btn_run_diag.config(state=state)
         self.btn_run_match.config(state=state)
+
+        # ✅ Cancel solo cuando está corriendo
+        self.btn_cancel.config(state=("normal" if running else "disabled"))
+
         if running:
             self.progress.start(12)
         else:
@@ -373,6 +452,7 @@ class App(tk.Tk):
             messagebox.showerror("Falta salida", "Elige una carpeta DB de salida.")
             return
 
+        self.cancel_requested = False
         self._ensure_file_logger(out_p)
         self._set_running(True)
 
@@ -387,17 +467,23 @@ class App(tk.Tk):
 
     def _worker_index(self, in_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
+            if self.cancel_requested:
+                self.logger.warning("Index cancelado antes de iniciar.")
+                return
+
             args = SimpleNamespace(
                 in_dir=str(in_p),
                 out_dir=str(out_p),
                 table_size=int(ts),
                 harmonics=int(harm),
                 bands=int(bands),
-                # Nota: no exponemos include_samples en UI Index (por defecto False).
-                # cmd_index usa getattr(..., False), así que está OK.
+                # no exponemos include_samples en UI Index (por defecto False).
             )
 
             rc = wtdiag.cmd_index(args)
+            if self.cancel_requested:
+                self.logger.warning("Index terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
+
             if rc == 0:
                 self.logger.info("Indexado OK. Se generó _INDEX.json y descriptores.")
                 self.logger.info(f"Log guardado en: {out_p / 'wt_gui.log'}")
@@ -407,7 +493,8 @@ class App(tk.Tk):
             self.logger.exception(f"Fallo inesperado: {e}")
         finally:
             self.logger.info("== INDEX END ==")
-            self.after(0, lambda: self._set_running(False))
+            if not self._closing:
+                self.after(0, lambda: self._set_running(False))
 
     # ---------------- Run: Diag ----------------
 
@@ -422,6 +509,7 @@ class App(tk.Tk):
             messagebox.showerror("Falta salida", "Elige dónde guardar el JSON del descriptor.")
             return
 
+        self.cancel_requested = False
         self._ensure_file_logger(out_p.parent)
         self._set_running(True)
 
@@ -436,6 +524,10 @@ class App(tk.Tk):
 
     def _worker_diag(self, wav_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
+            if self.cancel_requested:
+                self.logger.warning("Diag cancelado antes de iniciar.")
+                return
+
             args = SimpleNamespace(
                 wav=str(wav_p),
                 out=str(out_p),
@@ -445,6 +537,9 @@ class App(tk.Tk):
             )
 
             rc = wtdiag.cmd_diag(args)
+            if self.cancel_requested:
+                self.logger.warning("Diag terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
+
             if rc == 0:
                 self.logger.info("Diag OK. Se generó descriptor JSON.")
                 self.logger.info(f"Log guardado en: {out_p.parent / 'wt_gui.log'}")
@@ -454,7 +549,8 @@ class App(tk.Tk):
             self.logger.exception(f"Fallo inesperado: {e}")
         finally:
             self.logger.info("== DIAG END ==")
-            self.after(0, lambda: self._set_running(False))
+            if not self._closing:
+                self.after(0, lambda: self._set_running(False))
 
     # ---------------- Run: Match ----------------
 
@@ -476,6 +572,7 @@ class App(tk.Tk):
             messagebox.showerror("Falta salida", "Elige dónde guardar el report JSON.")
             return
 
+        self.cancel_requested = False
         self._ensure_file_logger(out_p.parent)
         self._set_running(True)
 
@@ -485,8 +582,13 @@ class App(tk.Tk):
         self.logger.info(f"Target: {target_p}")
         self.logger.info(f"Salida: {out_p}")
         self.logger.info(
-            f"Params: tableSize={ts} harmonics={harm} bands={bands} "
-            f"topk={self.match_topk.get()} eq_limit_db={self.match_eq_limit.get()} eq_smooth={self.match_eq_smooth.get()} "
+            "Params: "
+            f"tableSize={ts} harmonics={harm} bands={bands} "
+            f"topk={self.match_topk.get()} topn={self.match_topn.get()} "
+            f"gain_mode={self.match_gain_mode.get()} "
+            f"eq_limit_db={self.match_eq_limit.get()} eq_smooth={self.match_eq_smooth.get()} "
+            f"max_filters={self.match_max_filters.get()} min_sep_bands={self.match_min_sep_bands.get()} "
+            f"w_harm={self.match_w_harm.get()} w_eq={self.match_w_eq.get()} "
             f"include_samples={bool(self.match_include_samples.get())}"
         )
 
@@ -499,6 +601,10 @@ class App(tk.Tk):
 
     def _worker_match(self, db_p: Path, target_p: Path, out_p: Path, ts: int, harm: int, bands: int):
         try:
+            if self.cancel_requested:
+                self.logger.warning("Match cancelado antes de iniciar.")
+                return
+
             args = SimpleNamespace(
                 db_dir=str(db_p),
                 target=str(target_p),
@@ -506,13 +612,26 @@ class App(tk.Tk):
                 table_size=int(ts),
                 harmonics=int(harm),
                 bands=int(bands),
+
                 topk=int(self.match_topk.get()),
+                topn=int(self.match_topn.get()),
+                gain_mode=str(self.match_gain_mode.get()),
+
                 eq_limit_db=float(self.match_eq_limit.get()),
                 eq_smooth=float(self.match_eq_smooth.get()),
                 include_samples=bool(self.match_include_samples.get()),
+
+                max_filters=int(self.match_max_filters.get()),
+                min_sep_bands=int(self.match_min_sep_bands.get()),
+                w_harm=float(self.match_w_harm.get()),
+                w_eq=float(self.match_w_eq.get()),
             )
 
             rc = wtdiag.cmd_match(args)
+
+            if self.cancel_requested:
+                self.logger.warning("Match terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
+
             if rc == 0:
                 self.logger.info("Match OK. Se generó report JSON y .txt.")
                 self.logger.info(f"Report: {out_p}")
@@ -524,19 +643,33 @@ class App(tk.Tk):
             self.logger.exception(f"Fallo inesperado: {e}")
         finally:
             self.logger.info("== MATCH END ==")
-            self.after(0, lambda: self._set_running(False))
+            if not self._closing:
+                self.after(0, lambda: self._set_running(False))
 
     # ---------------- Log poll ----------------
 
     def _poll_logs(self):
+        if self._closing:
+            return
+
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                self.txt.insert("end", msg + "\n")
-                self.txt.see("end")
+                try:
+                    # ✅ FIX: si el widget murió / app cerró, no explotar
+                    self.txt.insert("end", msg + "\n")
+                    self.txt.see("end")
+                except (tk.TclError, RuntimeError):
+                    # ventana cerrada o widget destruido
+                    return
         except queue.Empty:
             pass
-        self.after(100, self._poll_logs)
+
+        # ✅ FIX: guardar after_id para poder cancelarlo en WM_DELETE_WINDOW
+        try:
+            self._poll_after_id = self.after(100, self._poll_logs)
+        except (tk.TclError, RuntimeError):
+            return
 
 
 if __name__ == "__main__":
