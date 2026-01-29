@@ -67,6 +67,7 @@ class App(tk.Tk):
         self.log_queue = queue.Queue()
 
         # Vars comunes
+        # ✅ PRO estandarizado SIEMPRE: tableSize fijo 2048
         self.table_size = tk.IntVar(value=2048)
         self.harmonics = tk.IntVar(value=64)
         self.bands = tk.IntVar(value=128)
@@ -75,15 +76,11 @@ class App(tk.Tk):
         self.in_dir = tk.StringVar()
         self.out_dir = tk.StringVar()
 
-        # ✅ NUEVO: PRO (Index)
-        self.index_pro = tk.BooleanVar(value=False)      # o True si quieres default PRO
-        self.index_pro_wav_dir = tk.StringVar(value="")  # opcional
-
         # Vars Diag
         self.diag_wav = tk.StringVar()
         self.diag_out = tk.StringVar()
 
-        # Vars Match (existentes)
+        # Vars Match
         self.match_db = tk.StringVar()
         self.match_target = tk.StringVar()
         self.match_out = tk.StringVar()
@@ -92,7 +89,7 @@ class App(tk.Tk):
         self.match_eq_smooth = tk.DoubleVar(value=1.5)
         self.match_include_samples = tk.BooleanVar(value=False)
 
-        # ✅ NUEVO: parámetros importantes del match (UI)
+        # parámetros match (UI)
         self.match_topn = tk.IntVar(value=10)
         self.match_gain_mode = tk.StringVar(value="rms")  # "rms" | "lufs"
         self.match_max_filters = tk.IntVar(value=6)
@@ -102,8 +99,6 @@ class App(tk.Tk):
 
         # refs UI que necesitamos habilitar/deshabilitar
         self._spin_table_size: Optional[ttk.Spinbox] = None
-        self._pro_wav_entry: Optional[ttk.Entry] = None
-        self._pro_wav_btn: Optional[ttk.Button] = None
 
         self._build_ui()
         self._setup_logging()
@@ -111,7 +106,7 @@ class App(tk.Tk):
         # ✅ cierre limpio
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Aplica estado inicial PRO a la UI
+        # ✅ PRO fijo: bloquear tableSize en 2048
         self._apply_pro_ui_state()
 
         # Arranca polling de logs
@@ -140,6 +135,11 @@ class App(tk.Tk):
         ttk.Spinbox(opt, from_=32, to=256, increment=32, textvariable=self.bands, width=10)\
             .grid(row=0, column=5, padx=6)
 
+        # ✅ Nota visible: PRO fijo
+        ttk.Label(opt, text="PRO estandarizado: Index exporta __CAN__2048x64 (WAV+JSON) en el Output.").grid(
+            row=1, column=0, columnspan=6, sticky="w", pady=(6, 0)
+        )
+
         opt.columnconfigure(6, weight=1)
 
         # Notebook con 3 tabs
@@ -165,7 +165,7 @@ class App(tk.Tk):
         self.btn_open_output = ttk.Button(act, text="Abrir salida (según tab)", command=self._open_current_output)
         self.btn_open_output.pack(side="left")
 
-        # ✅ NUEVO: botón Cancel
+        # botón Cancel
         self.btn_cancel = ttk.Button(act, text="Cancelar", command=self._request_cancel, state="disabled")
         self.btn_cancel.pack(side="left", padx=10)
 
@@ -190,30 +190,20 @@ class App(tk.Tk):
         ttk.Entry(frm, textvariable=self.in_dir, width=72).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(frm, text="Elegir...", command=self._pick_in).grid(row=0, column=2)
 
-        ttk.Label(frm, text="Carpeta DB (salida descriptores):").grid(row=1, column=0, sticky="w")
+        # ✅ Un solo Output (DB + WAV CAN + JSON CAN + _INDEX.json)
+        ttk.Label(frm, text="Output (DB + WAV __CAN + JSON __CAN + _INDEX.json):").grid(row=1, column=0, sticky="w")
         ttk.Entry(frm, textvariable=self.out_dir, width=72).grid(row=1, column=1, sticky="we", padx=6)
         ttk.Button(frm, text="Elegir...", command=self._pick_out).grid(row=1, column=2)
 
         frm.columnconfigure(1, weight=1)
 
-        # ✅ NUEVO: Modo PRO (Index)
-        profrm = ttk.LabelFrame(parent, text="Modo PRO (Index)")
-        profrm.pack(fill="x", **pad)
-
-        ttk.Checkbutton(
-            profrm,
-            text="Modo PRO (export 2048x64 PCM16)",
-            variable=self.index_pro,
-            command=self._apply_pro_ui_state
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
-
-        ttk.Label(profrm, text="(Opcional) Carpeta export WAV canónicos:").grid(row=1, column=0, sticky="w", padx=6)
-        self._pro_wav_entry = ttk.Entry(profrm, textvariable=self.index_pro_wav_dir, width=64)
-        self._pro_wav_entry.grid(row=1, column=1, sticky="we", padx=6)
-        self._pro_wav_btn = ttk.Button(profrm, text="Elegir...", command=self._pick_pro_wav_dir)
-        self._pro_wav_btn.grid(row=1, column=2, padx=6)
-
-        profrm.columnconfigure(1, weight=1)
+        info = ttk.LabelFrame(parent, text="Modo PRO (siempre activo)")
+        info.pack(fill="x", **pad)
+        ttk.Label(
+            info,
+            text="Index siempre exporta: base__CAN__2048x64.wav + base__CAN__2048x64.json en el Output.\n"
+                 "No se usa carpeta separada para WAV; todo queda junto."
+        ).pack(anchor="w", padx=8, pady=6)
 
         runfrm = ttk.Frame(parent)
         runfrm.pack(fill="x", **pad)
@@ -221,7 +211,7 @@ class App(tk.Tk):
         self.btn_run_index = ttk.Button(runfrm, text="RUN (Indexar)", command=self._run_index)
         self.btn_run_index.pack(side="left")
 
-        ttk.Label(runfrm, text="Genera: descriptores JSON + _INDEX.json").pack(side="left", padx=12)
+        ttk.Label(runfrm, text="Genera: _INDEX.json + WAV/JSON canónicos (__CAN) en el Output.").pack(side="left", padx=12)
 
     def _build_tab_diag(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 6}
@@ -267,11 +257,9 @@ class App(tk.Tk):
 
         frm.columnconfigure(1, weight=1)
 
-        # Parámetros match
         opts = ttk.LabelFrame(parent, text="Parámetros Match")
         opts.pack(fill="x", **pad)
 
-        # Row 0
         ttk.Label(opts, text="topK").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(opts, from_=3, to=200, increment=1, textvariable=self.match_topk, width=10)\
             .grid(row=0, column=1, padx=6)
@@ -287,7 +275,6 @@ class App(tk.Tk):
         ttk.Checkbutton(opts, text="Include samples (type=sample)", variable=self.match_include_samples)\
             .grid(row=0, column=6, padx=10, sticky="w")
 
-        # Row 1
         ttk.Label(opts, text="EQ limit (dB)").grid(row=1, column=0, sticky="w")
         ttk.Spinbox(opts, from_=1.0, to=18.0, increment=0.5, textvariable=self.match_eq_limit, width=10)\
             .grid(row=1, column=1, padx=6)
@@ -304,7 +291,6 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=1, to=32, increment=1, textvariable=self.match_min_sep_bands, width=10)\
             .grid(row=1, column=7, padx=6)
 
-        # Row 2
         ttk.Label(opts, text="w_harm").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(opts, from_=0.0, to=5.0, increment=0.1, textvariable=self.match_w_harm, width=10)\
             .grid(row=2, column=1, padx=6)
@@ -323,46 +309,17 @@ class App(tk.Tk):
 
         ttk.Label(runfrm, text="Genera report JSON + .txt con filtros PEQ aproximados.").pack(side="left", padx=12)
 
-    # ✅ NUEVO: aplica estado PRO a UI + fuerza tableSize
+    # ✅ PRO fijo: tableSize = 2048 y spinbox disabled
     def _apply_pro_ui_state(self):
-        pro = bool(self.index_pro.get())
-        if pro:
-            # fuerza idioma único
+        try:
+            self.table_size.set(2048)
+        except Exception:
+            pass
+        if self._spin_table_size is not None:
             try:
-                self.table_size.set(2048)
+                self._spin_table_size.config(state="disabled")
             except Exception:
                 pass
-
-            # deshabilita tableSize para evitar confusiones
-            if self._spin_table_size is not None:
-                try:
-                    self._spin_table_size.config(state="disabled")
-                except Exception:
-                    pass
-
-            # habilita pro_wav_dir
-            if self._pro_wav_entry is not None:
-                self._pro_wav_entry.config(state="normal")
-            if self._pro_wav_btn is not None:
-                self._pro_wav_btn.config(state="normal")
-        else:
-            # habilita tableSize
-            if self._spin_table_size is not None:
-                try:
-                    self._spin_table_size.config(state="normal")
-                except Exception:
-                    pass
-
-            # deshabilita pro_wav_dir (y opcionalmente limpia)
-            if self._pro_wav_entry is not None:
-                self._pro_wav_entry.config(state="disabled")
-            if self._pro_wav_btn is not None:
-                self._pro_wav_btn.config(state="disabled")
-
-    def _pick_pro_wav_dir(self):
-        p = filedialog.askdirectory(title="Elige carpeta para export WAV canónicos (PRO)")
-        if p:
-            self.index_pro_wav_dir.set(p)
 
     # ---------------- Logging ----------------
 
@@ -397,7 +354,7 @@ class App(tk.Tk):
             self.in_dir.set(p)
 
     def _pick_out(self):
-        p = filedialog.askdirectory(title="Elige carpeta DB de salida (descriptores)")
+        p = filedialog.askdirectory(title="Elige Output (DB + WAV/JSON __CAN + _INDEX.json)")
         if p:
             self.out_dir.set(p)
 
@@ -447,7 +404,7 @@ class App(tk.Tk):
     # ---------------- Helpers ----------------
 
     def _on_close(self):
-        """✅ Cierre limpio: cancela after() del polling y destruye la ventana."""
+        """Cierre limpio: cancela after() del polling y destruye la ventana."""
         self._closing = True
         try:
             if self._poll_after_id is not None:
@@ -456,7 +413,6 @@ class App(tk.Tk):
         except Exception:
             pass
 
-        # si hay tarea corriendo, marca cancel solicitado (no mata thread, pero queda registrado)
         if getattr(self.btn_cancel, "state", None) != "disabled":
             self.cancel_requested = True
 
@@ -466,7 +422,7 @@ class App(tk.Tk):
             pass
 
     def _request_cancel(self):
-        """✅ Cancelación suave: marca flag y el worker lo registra/checkea por etapas."""
+        """Cancelación suave: marca flag (no mata thread)."""
         if not self.cancel_requested:
             self.cancel_requested = True
             self.logger.warning("CANCEL REQUESTED: se intentará detener al terminar la etapa actual.")
@@ -502,7 +458,6 @@ class App(tk.Tk):
         self.btn_run_diag.config(state=state)
         self.btn_run_match.config(state=state)
 
-        # ✅ Cancel solo cuando está corriendo
         self.btn_cancel.config(state=("normal" if running else "disabled"))
 
         if running:
@@ -511,6 +466,7 @@ class App(tk.Tk):
             self.progress.stop()
 
     def _common_args(self):
+        # table_size siempre 2048 (PRO fijo)
         return int(self.table_size.get()), int(self.harmonics.get()), int(self.bands.get())
 
     # ---------------- Run: Index ----------------
@@ -523,27 +479,23 @@ class App(tk.Tk):
             messagebox.showerror("Falta entrada", "Elige una carpeta válida de wavetables.")
             return
         if not str(out_p).strip():
-            messagebox.showerror("Falta salida", "Elige una carpeta DB de salida.")
+            messagebox.showerror("Falta salida", "Elige un Output válido.")
             return
 
         self.cancel_requested = False
         self._ensure_file_logger(out_p)
         self._set_running(True)
 
-        # Si PRO está activo, forzamos 2048 en UI y en args
-        pro = bool(self.index_pro.get())
-        if pro:
-            self.table_size.set(2048)
+        # ✅ PRO siempre activo
+        self.table_size.set(2048)
+        self._apply_pro_ui_state()
 
         ts, harm, bands = self._common_args()
         self.logger.info("== INDEX START ==")
         self.logger.info(f"Entrada: {in_p}")
         self.logger.info(f"Salida:  {out_p}")
         self.logger.info(f"Params: tableSize={ts} harmonics={harm} bands={bands}")
-        self.logger.info(f"PRO: {pro} (export 2048x64 PCM16)")
-
-        if pro and self.index_pro_wav_dir.get().strip():
-            self.logger.info(f"PRO wav dir: {self.index_pro_wav_dir.get().strip()}")
+        self.logger.info("PRO: True (export __CAN__2048x64 PCM16, WAV+JSON en Output)")
 
         th = threading.Thread(target=self._worker_index, args=(in_p, out_p, ts, harm, bands), daemon=True)
         th.start()
@@ -554,13 +506,8 @@ class App(tk.Tk):
                 self.logger.warning("Index cancelado antes de iniciar.")
                 return
 
-            pro = bool(self.index_pro.get())
-            if pro:
-                ts = 2048  # fuerza real por seguridad
-
-            pro_wav_dir = self.index_pro_wav_dir.get().strip()
-            if not pro_wav_dir:
-                pro_wav_dir = None  # que el CLI use default OUT/EXPORT/WAV
+            # ✅ forzar por seguridad
+            ts = 2048
 
             args = SimpleNamespace(
                 in_dir=str(in_p),
@@ -568,11 +515,9 @@ class App(tk.Tk):
                 table_size=int(ts),
                 harmonics=int(harm),
                 bands=int(bands),
-                # no exponemos include_samples en UI Index (por defecto False).
-
-                # ✅ PRO flags hacia cmd_index (wtdiag-2)
-                pro=bool(pro),
-                pro_wav_dir=pro_wav_dir,
+                # PRO fijo:
+                pro=True,
+                # NO pro_wav_dir (ya no existe)
             )
 
             rc = wtdiag.cmd_index(args)
@@ -580,7 +525,7 @@ class App(tk.Tk):
                 self.logger.warning("Index terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
 
             if rc == 0:
-                self.logger.info("Indexado OK. Se generó _INDEX.json y descriptores.")
+                self.logger.info("Indexado OK. Se generó _INDEX.json y WAV/JSON __CAN.")
                 self.logger.info(f"Log guardado en: {out_p / 'wt_gui.log'}")
             else:
                 self.logger.error(f"Indexado terminó con código {rc}. Revisa logs.")
@@ -607,6 +552,10 @@ class App(tk.Tk):
         self.cancel_requested = False
         self._ensure_file_logger(out_p.parent)
         self._set_running(True)
+
+        # tableSize fijo
+        self.table_size.set(2048)
+        self._apply_pro_ui_state()
 
         ts, harm, bands = self._common_args()
         self.logger.info("== DIAG START ==")
@@ -670,6 +619,10 @@ class App(tk.Tk):
         self.cancel_requested = False
         self._ensure_file_logger(out_p.parent)
         self._set_running(True)
+
+        # tableSize fijo
+        self.table_size.set(2048)
+        self._apply_pro_ui_state()
 
         ts, harm, bands = self._common_args()
         self.logger.info("== MATCH START ==")
@@ -751,16 +704,13 @@ class App(tk.Tk):
             while True:
                 msg = self.log_queue.get_nowait()
                 try:
-                    # ✅ FIX: si el widget murió / app cerró, no explotar
                     self.txt.insert("end", msg + "\n")
                     self.txt.see("end")
                 except (tk.TclError, RuntimeError):
-                    # ventana cerrada o widget destruido
                     return
         except queue.Empty:
             pass
 
-        # ✅ FIX: guardar after_id para poder cancelarlo en WM_DELETE_WINDOW
         try:
             self._poll_after_id = self.after(100, self._poll_logs)
         except (tk.TclError, RuntimeError):
@@ -769,3 +719,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     App().mainloop()
+
