@@ -26,6 +26,21 @@ FEATURE_SR = 48000  # SR "canónico" solo para mapear bandas (comparabilidad del
 TARGET_PEAK = 0.999
 COMMON_TABLE_SIZES = (256, 512, 1024, 2048, 4096, 8192)
 
+# ----------------------------
+# Formato canónico PRO (export para plugin)
+# ----------------------------
+# Estos parámetros definen el "idioma" único de tu librería exportada para el plugin.
+# Todo wavetable exportado en modo PRO queda en:
+#   - mono
+#   - tableSize = 2048 samples por frame
+#   - numFrames = 64 frames
+#   - WAV concatenado (2048*64 samples)
+#   - PCM16 (int16)
+PRO_TABLE_SIZE = 2048
+PRO_NUM_FRAMES = 64
+PRO_SR = 44100
+
+
 # Loop/phase repair (wavetables reales)
 LOOP_FIX_FADE = 32          # samples (en tableSize)
 LOOP_FIX_VALUE_THR = 0.02   # umbral de discontinuidad (valor)
@@ -217,6 +232,155 @@ def standardize_frame(frame: np.ndarray, table_size: int, *, loop_fix: bool = Tr
         f = remove_dc(f)
     f = normalize_peak(f, target_peak=TARGET_PEAK)
     return f.astype(np.float32)
+
+
+# ----------------------------
+# Export canónico PRO (2048x64 PCM16)
+# ----------------------------
+
+def interpolate_frames(frames: np.ndarray, target_frames: int = PRO_NUM_FRAMES) -> np.ndarray:
+    """
+    Ajusta el número de frames mediante:
+      - si N == 1: duplica
+      - si N > 1: interpolación lineal en el eje de frames
+
+    frames: shape (N, tableSize)
+    return: shape (target_frames, tableSize)
+    """
+    frames = np.asarray(frames, dtype=np.float32)
+    if frames.ndim != 2:
+        raise ValueError(f"interpolate_frames: se esperaba (N, tableSize), llegó {frames.shape}")
+    n, ts = frames.shape
+    if target_frames <= 0:
+        raise ValueError("interpolate_frames: target_frames debe ser > 0")
+
+    if n == target_frames:
+        return frames.astype(np.float32)
+
+    if n == 1:
+        return np.repeat(frames, target_frames, axis=0).astype(np.float32)
+
+    # Mapea índices 0..target-1 a posiciones 0..n-1
+    pos = np.linspace(0.0, float(n - 1), target_frames, dtype=np.float32)
+    i0 = np.floor(pos).astype(np.int32)
+    i1 = np.minimum(i0 + 1, n - 1).astype(np.int32)
+    t = (pos - i0.astype(np.float32)).reshape(-1, 1)
+
+    out = (1.0 - t) * frames[i0] + t * frames[i1]
+    return out.astype(np.float32)
+
+def float_to_pcm16(x: np.ndarray) -> np.ndarray:
+    """
+    Convierte float [-1, 1] a PCM16 (int16) con regla estable:
+      - clamp [-1, 1]
+      - int16 = round(x * 32767)
+    Nota: -1.0 mapea a -32767 (comportamiento común en audio PCM).
+    """
+    y = np.asarray(x, dtype=np.float32)
+    y = np.clip(y, -1.0, 1.0)
+    y_i16 = np.round(y * 32767.0).astype(np.int16)
+    return y_i16
+
+def export_canonical_wavetable(
+    src_wav: Path,
+    dst_wav: Path,
+    table_size: int = PRO_TABLE_SIZE,
+    num_frames: int = PRO_NUM_FRAMES,
+    sr_out: int = PRO_SR,
+    *,
+    loop_fix: bool = True,
+    write_sidecar_json: bool = True,
+) -> Dict[str, Any]:
+    """
+    Exporta un wavetable al formato canónico PRO:
+
+      - Lee WAV (mono)
+      - Detecta layout (single vs multi vs sample)
+      - Separa frames si es multi
+      - Estandariza cada frame con standardize_frame() (DC, loopfix, normalize, resample a table_size)
+      - Ajusta a num_frames (duplicar o interpolar)
+      - Concatena (table_size * num_frames)
+      - Convierte a PCM16 (int16)
+      - Escribe WAV mono PCM_16 con soundfile
+      - (Opcional) Escribe JSON sidecar auditable (mismo nombre .json)
+
+    Devuelve dict con metadatos (útil para indexado PRO).
+    """
+    src_wav = Path(src_wav)
+    dst_wav = Path(dst_wav)
+    dst_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    x, sr_in = safe_read_wav(src_wav)
+    x = standardize_audio(x)
+
+    wtype, in_table, frames_inferred = infer_layout(len(x), table_size)
+
+    frames_original = 1
+    type_original = wtype
+
+    if wtype == "single_cycle":
+        frames_original = 1
+        raw = x[:in_table]
+        frame = standardize_frame(raw, table_size, loop_fix=loop_fix)
+        frames = frame.reshape(1, -1)
+
+    elif wtype == "multi_frame":
+        frames_original = int(frames_inferred)
+        x = ensure_len(x, in_table * frames_original)
+        raw_frames = x.reshape(frames_original, in_table)
+        frames = np.stack(
+            [standardize_frame(raw_frames[i], table_size, loop_fix=loop_fix) for i in range(frames_original)],
+            axis=0,
+        ).astype(np.float32)
+
+    else:
+        # type="sample": no es un wavetable “limpio”.
+        # En export PRO hacemos algo robusto: tomamos un trozo y lo tratamos como single.
+        frames_original = 1
+        raw = x[:min(len(x), table_size)]
+        frame = standardize_frame(raw, table_size, loop_fix=loop_fix)
+        frames = frame.reshape(1, -1)
+
+    # Ajuste a num_frames canónico
+    frames_can = interpolate_frames(frames, target_frames=num_frames)
+
+    # Concatena frames (formato wavetable concatenado)
+    wavetable_float = frames_can.reshape(-1).astype(np.float32)
+
+    # Asegura longitud exacta
+    expected_len = int(table_size * num_frames)
+    wavetable_float = ensure_len(wavetable_float, expected_len)
+
+    # PCM16
+    wavetable_i16 = float_to_pcm16(wavetable_float)
+
+    # Escribe WAV PCM_16 mono
+    sf.write(str(dst_wav), wavetable_i16, int(sr_out), subtype="PCM_16")
+
+    meta: Dict[str, Any] = {
+        "source_path": str(src_wav.as_posix()),
+        "export_path": str(dst_wav.as_posix()),
+        "tableSize": int(table_size),
+        "numFrames": int(num_frames),
+        "sampleRate_out": int(sr_out),
+        "sampleRate_in": int(sr_in),
+        "type_original": str(type_original),
+        "frames_original": int(frames_original),
+        "format": "wav_pcm16_mono_concatenated",
+        "target_peak": float(TARGET_PEAK),
+        "loop_fix": bool(loop_fix),
+    }
+
+    if write_sidecar_json:
+        sidecar = dst_wav.with_suffix(".json")
+        try:
+            with open(sidecar, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except Exception:
+            # No rompemos export por fallo de sidecar
+            pass
+
+    return meta
 
 # ----------------------------
 # Especificación de features
