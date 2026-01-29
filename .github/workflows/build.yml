@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   build-windows-exe:
-    runs-on: windows-latest
+    # ✅ FIX: runner fijo para reproducibilidad
+    runs-on: windows-2022
 
     env:
       APP_NAME: WTDiagGUI
@@ -44,6 +45,35 @@ jobs:
           if (!(Test-Path "wtdiag-2.py")) { throw "Falta wtdiag-2.py (CLI/front)" }
           if (!(Test-Path "wtdiag.py")) { throw "Falta wtdiag.py (wrapper importable para GUI)" }
 
+      # ✅ NUEVO: smoke test antes del build (numpy/scipy/soundfile + pipeline diag)
+      - name: Smoke test (generate WAV + run diag)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python - << 'PY'
+          import numpy as np
+          import soundfile as sf
+          from pathlib import Path
+
+          sr = 48000
+          dur = 0.2
+          t = np.linspace(0, dur, int(sr*dur), endpoint=False)
+          x = 0.2*np.sin(2*np.pi*440*t).astype(np.float32)
+
+          tmp = Path("smoke_tmp")
+          tmp.mkdir(exist_ok=True)
+          wav_path = tmp / "tone.wav"
+          out_json = tmp / "tone.descriptor.json"
+
+          sf.write(wav_path, x, sr)
+          print("Wrote:", wav_path, "sr=", sr, "n=", len(x))
+          PY
+
+          python wtdiag-2.py diag --wav smoke_tmp/tone.wav --out smoke_tmp/tone.descriptor.json --table-size 2048 --harmonics 64 --bands 128
+
+          if (!(Test-Path "smoke_tmp/tone.descriptor.json")) { throw "Smoke test fallo: no se generó descriptor JSON" }
+          Write-Host "Smoke test OK: descriptor generado."
+
       - name: Build EXE (PyInstaller onedir, windowed)
         shell: pwsh
         run: |
@@ -72,4 +102,17 @@ jobs:
           name: WTDiagGUI-windows-onedir
           path: dist/${{ env.APP_NAME }}/
           if-no-files-found: error
+
+      # ✅ NUEVO (opcional): logs/build outputs útiles para debug si falla
+      - name: Upload build logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WTDiagGUI-build-logs
+          path: |
+            build/
+            *.spec
+            smoke_tmp/
+            dist/${{ env.APP_NAME }}/wt_gui.log
+          if-no-files-found: warn
 
