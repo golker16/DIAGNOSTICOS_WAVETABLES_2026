@@ -26,6 +26,14 @@ FEATURE_SR = 48000  # SR "canónico" solo para mapear bandas (comparabilidad del
 TARGET_PEAK = 0.999
 COMMON_TABLE_SIZES = (256, 512, 1024, 2048, 4096, 8192)
 
+# ----------------------------
+# Modo PRO: formato canónico fijo (para DB y export __CAN__2048x64)
+# ----------------------------
+PRO_TABLE_SIZE = 2048
+PRO_NUM_FRAMES = 64
+# SR de salida del WAV canónico (no afecta el análisis: el análisis usa FEATURE_SR)
+PRO_SR = FEATURE_SR
+
 # Loop/phase repair (wavetables reales)
 LOOP_FIX_FADE = 32          # samples (en tableSize)
 LOOP_FIX_VALUE_THR = 0.02   # umbral de discontinuidad (valor)
@@ -299,6 +307,115 @@ def infer_layout(n_samples: int, preferred_table: int) -> Tuple[str, int, int]:
 
     # Antes: "unknown"
     return "sample", preferred_table, 1
+
+# ----------------------------
+# Export PRO: WAV canónico __CAN__2048x64 (mono, frames concatenados)
+# ----------------------------
+
+def _resample_to_sr(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Resample polyphase (rápido y robusto)."""
+    if int(sr_in) == int(sr_out):
+        return x.astype(np.float32)
+    sr_in = int(sr_in)
+    sr_out = int(sr_out)
+    g = math.gcd(sr_in, sr_out)
+    up = sr_out // g
+    down = sr_in // g
+    y = resample_poly(x.astype(np.float32), up, down).astype(np.float32)
+    return y
+
+def _interp_frames_count(frames: np.ndarray, n_out: int) -> np.ndarray:
+    """Interpola en el eje de frames: (n_in, table) -> (n_out, table)."""
+    n_in, table = frames.shape
+    if n_in == n_out:
+        return frames.astype(np.float32)
+    x_src = np.linspace(0.0, 1.0, n_in, dtype=np.float32)
+    x_tgt = np.linspace(0.0, 1.0, n_out, dtype=np.float32)
+
+    out = np.empty((n_out, table), dtype=np.float32)
+    for s in range(table):
+        out[:, s] = np.interp(x_tgt, x_src, frames[:, s]).astype(np.float32)
+    return out
+
+def export_canonical_wavetable(
+    in_wav: Path,
+    out_wav: Path,
+    *,
+    table_size: int = PRO_TABLE_SIZE,
+    num_frames: int = PRO_NUM_FRAMES,
+    sr_out: int = PRO_SR,
+    loop_fix: bool = True,
+    write_sidecar_json: bool = False,
+) -> Dict[str, Any]:
+    """
+    Exporta un WAV 'canónico' mono con frames concatenados:
+      - table_size samples por frame
+      - num_frames frames
+      - sr_out de salida (PCM16)
+
+    Devuelve un meta dict con 'type_original' para que el index pueda decidir si saltar samples.
+    """
+    in_wav = Path(in_wav)
+    out_wav = Path(out_wav)
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    x, sr_in = safe_read_wav(in_wav)
+    x = standardize_audio(x)
+    x = _resample_to_sr(x, int(sr_in), int(sr_out))
+
+    # Inferir layout sobre el audio ya en sr_out (solo para dividir/etiquetar)
+    type_original, ts_in, nf_in = infer_layout(int(len(x)), int(table_size))
+
+    frames: List[np.ndarray] = []
+
+    if type_original == "multi_frame" and nf_in > 1 and ts_in > 0 and (ts_in * nf_in) <= len(x):
+        raw = [x[i * ts_in : (i + 1) * ts_in] for i in range(nf_in)]
+        raw_std = [standardize_frame(fr, int(table_size), loop_fix=loop_fix) for fr in raw]
+        fr_np = np.stack(raw_std, axis=0).astype(np.float32)  # (nf_in, table_size)
+        fr_np = _interp_frames_count(fr_np, int(num_frames))
+        frames = [fr_np[i, :].copy() for i in range(int(num_frames))]
+
+    elif type_original == "single_cycle":
+        fr = standardize_frame(x, int(table_size), loop_fix=loop_fix)
+        frames = [fr.copy() for _ in range(int(num_frames))]
+
+    else:
+        # type_original == "sample" (o cualquier caso raro):
+        # tomamos num_frames ventanas a lo largo del audio.
+        if len(x) < int(table_size):
+            fr = standardize_frame(x, int(table_size), loop_fix=loop_fix)
+            frames = [fr.copy() for _ in range(int(num_frames))]
+        else:
+            max_start = max(0, len(x) - int(table_size))
+            starts = np.linspace(0, max_start, int(num_frames), dtype=np.float32)
+            for st in starts:
+                s0 = int(st)
+                seg = x[s0 : s0 + int(table_size)]
+                if len(seg) < int(table_size):
+                    seg = np.pad(seg, (0, int(table_size) - len(seg)), mode="constant")
+                frames.append(standardize_frame(seg, int(table_size), loop_fix=loop_fix))
+
+    can = np.concatenate(frames, axis=0).astype(np.float32)
+    sf.write(str(out_wav), can, int(sr_out), subtype="PCM_16")
+
+    meta: Dict[str, Any] = {
+        "type_original": str(type_original),
+        "sr_in": int(sr_in),
+        "sr_out": int(sr_out),
+        "table_size": int(table_size),
+        "num_frames": int(num_frames),
+        "input_samples": int(len(x)),
+        "output_samples": int(len(can)),
+        "in_wav": str(in_wav),
+        "out_wav": str(out_wav),
+    }
+
+    if write_sidecar_json:
+        side = out_wav.with_suffix(".export_meta.json")
+        with open(side, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return meta
 
 # ----------------------------
 # DSP features (ADN, envelope, tono/ruido, LUFS)
