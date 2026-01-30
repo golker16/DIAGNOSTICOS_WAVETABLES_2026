@@ -107,9 +107,11 @@ def _index_one(
     Worker para index en paralelo.
     Devuelve dict con:
       - ok: bool
-      - skipped_sample: bool
-      - out_json_name: str (si ok o si skipped_sample pero se generó JSON en PRO)
+      - skipped_sample: bool  (solo usado en NO-PRO; en PRO es informativo)
+      - out_json_name: str
       - entry: dict (si ok)
+      - type_exported: str (PRO)
+      - wavetable_like: bool (PRO)
       - error: str (si falla)
       - wav: str
     """
@@ -143,45 +145,62 @@ def _index_one(
                 write_sidecar_json=False,
             )
 
-            # ✅ NUEVO: NO retornar antes de escribir JSON (siempre genera JSON visible)
-            is_sample_original = (str(export_meta.get("type_original", "")) == "sample")
+            # ---------------------------------------------
+            # ✅ FORZAR UTILIZABLE (TU CASO):
+            #   - SIEMPRE exportar
+            #   - SIEMPRE escribir JSON
+            #   - SIEMPRE devolver ok=True + entry (entra a _INDEX.json)
+            #   - SOLO ETIQUETAR (no excluir)
+            # ---------------------------------------------
+            type_original = str(export_meta.get("type_original", "")) if export_meta else ""
+            is_sample_original = (type_original == "sample")
 
-            # Diagnosticar el export (siempre), para generar JSON visible
+            # Diagnosticar el export (SIEMPRE), para que el JSON exista y sea visible
             desc = core.process_wavetable(export_path, core.PRO_TABLE_SIZE, harmonics, bands)
 
+            type_exported = str(getattr(desc, "type", ""))
+            wavetable_like = bool(type_exported != "sample")
+
             spec = core.descriptor_to_spec(desc)
-            # Añade auditoría útil:
+
+            # ✅ Auditoría / trazas para priorizar luego
             spec["source_path"] = source_path_str
-            spec["type_original"] = str(export_meta.get("type_original", ""))
-            spec["skipped_sample"] = bool(is_sample_original and not include_samples)
+            spec["type_original"] = type_original
+            spec["type_exported"] = type_exported
+            spec["forced_kept"] = True
+            spec["wavetable_like"] = wavetable_like
+
+            # ✅ "skipped_sample" SOLO informativo (ya no excluye)
+            # - Si no quieres incluir samples en match por defecto, quedará True cuando sea sample-like.
+            spec["skipped_sample"] = bool((type_exported == "sample") and (not include_samples))
+            spec["sample_original"] = bool(is_sample_original)
 
             with open(out_json, "w", encoding="utf-8") as f:
                 json.dump(spec, f, ensure_ascii=False, indent=2)
 
-            # Si era sample y no queremos incluir samples, lo marcamos como skipped (pero el JSON ya existe)
-            if is_sample_original and not include_samples:
-                return {
-                    "ok": False,
-                    "skipped_sample": True,
-                    "out_json_name": out_json_name,
-                    "wav": str(wav_path),
-                }
-
             entry: Dict[str, Any] = {
                 "path": str(export_path.as_posix()),   # ✅ wav canónico (plugin-safe)
                 "descriptor": out_json_name,           # ✅ json grande al lado
-                "type": desc.type,
+                "type": type_exported,                # ✅ tipo del EXPORT analizado
                 "family": desc.diagnosis.family,
                 "best_for": desc.diagnosis.best_for,
-                "source_path": source_path_str,        # ✅ auditoría opcional
+                "source_path": source_path_str,
                 "pro": True,
+
+                # ✅ Nuevos campos para priorizar sin perder nada
+                "type_original": type_original,
+                "type_exported": type_exported,
+                "wavetable_like": wavetable_like,
+                "forced_kept": True,
             }
 
             return {
                 "ok": True,
-                "skipped_sample": False,
+                "skipped_sample": False,  # en PRO no se usa para excluir
                 "out_json_name": out_json_name,
                 "entry": entry,
+                "type_exported": type_exported,
+                "wavetable_like": wavetable_like,
                 "wav": str(wav_path),
             }
 
@@ -226,7 +245,7 @@ def _index_one(
             "error": f"{type(e).__name__}: {e}",
             "wav": str(wav_path),
         }
-        # ✅ Extra opcional: paths para diagnóstico
+        # ✅ Extra: paths para diagnóstico
         if out_json is not None:
             payload["out_json"] = str(out_json.as_posix())
         if export_path is not None:
@@ -267,17 +286,70 @@ def cmd_index(args) -> int:
 
     processed = 0
     kept = 0
+
+    # ✅ En NO-PRO: "skipped_samples" = excluidos.
+    # ✅ En PRO: lo reutilizamos como métrica informativa: "export_type_sample_count".
     skipped_samples = 0
+
+    # ✅ Nuevos contadores (solo metadata, sobre todo útil en PRO)
+    export_type_sample_count = 0
+    export_type_wavetable_count = 0
+
     failed_files = 0
 
     db_entries: List[Dict[str, Any]] = []
 
     def _progress(i_done: int):
         if i_done % 50 == 0 or i_done == len(wavs):
-            print(
-                f"[index] {i_done}/{len(wavs)} ... "
-                f"(kept={kept}, failed={failed_files}, skipped_samples={skipped_samples})"
-            )
+            if pro:
+                print(
+                    f"[index] {i_done}/{len(wavs)} ... "
+                    f"(kept={kept}, failed={failed_files}, export_type_sample_count={skipped_samples})"
+                )
+            else:
+                print(
+                    f"[index] {i_done}/{len(wavs)} ... "
+                    f"(kept={kept}, failed={failed_files}, skipped_samples={skipped_samples})"
+                )
+
+    def _consume_result(res: Dict[str, Any], wav_fallback: Optional[Path] = None):
+        nonlocal kept, skipped_samples, failed_files, export_type_sample_count, export_type_wavetable_count
+
+        if pro:
+            # ✅ PRO: nunca excluimos. Si ok -> siempre entra.
+            if res.get("ok"):
+                ent = res.get("entry")
+                if ent:
+                    db_entries.append(ent)
+                    kept += 1
+
+                    # métrica informativa: sample-like vs wavetable-like
+                    texp = str(res.get("type_exported") or ent.get("type_exported") or ent.get("type") or "")
+                    if texp == "sample":
+                        export_type_sample_count += 1
+                        skipped_samples += 1  # reuse para progress/compat
+                    else:
+                        export_type_wavetable_count += 1
+                else:
+                    # raro: ok sin entry
+                    failed_files += 1
+                    w = res.get("wav") or (str(wav_fallback) if wav_fallback else "(wav?)")
+                    print(f"[index] ERROR (ok sin entry) en {w}")
+            else:
+                failed_files += 1
+                w = res.get("wav") or (str(wav_fallback) if wav_fallback else "(wav?)")
+                print(f"[index] ERROR en {w}: {res.get('error', 'error desconocido')}")
+        else:
+            # ✅ NO-PRO: comportamiento original (excluir samples si include_samples=False)
+            if res.get("skipped_sample"):
+                skipped_samples += 1
+            elif res.get("ok"):
+                db_entries.append(res["entry"])
+                kept += 1
+            else:
+                failed_files += 1
+                w = res.get("wav") or (str(wav_fallback) if wav_fallback else "(wav?)")
+                print(f"[index] ERROR en {w}: {res.get('error', 'error desconocido')}")
 
     if jobs == 1:
         for i, p in enumerate(wavs, 1):
@@ -293,15 +365,7 @@ def cmd_index(args) -> int:
                 pro=pro,
             )
 
-            if res.get("skipped_sample"):
-                skipped_samples += 1
-            elif res.get("ok"):
-                db_entries.append(res["entry"])
-                kept += 1
-            else:
-                failed_files += 1
-                print(f"[index] ERROR en {p}: {res.get('error', 'error desconocido')}")
-
+            _consume_result(res, wav_fallback=p)
             _progress(i)
 
     else:
@@ -323,16 +387,7 @@ def cmd_index(args) -> int:
                 processed += 1
                 done += 1
                 res = fut.result()
-
-                if res.get("skipped_sample"):
-                    skipped_samples += 1
-                elif res.get("ok"):
-                    db_entries.append(res["entry"])
-                    kept += 1
-                else:
-                    failed_files += 1
-                    print(f"[index] ERROR en {res.get('wav', '(wav?)')}: {res.get('error', 'error desconocido')}")
-
+                _consume_result(res)
                 _progress(done)
 
     # Mantener orden estable en entries (por nombre descriptor)
@@ -347,11 +402,16 @@ def cmd_index(args) -> int:
         "processed": int(len(wavs)),
         "kept": int(kept),
         "failed_files": int(failed_files),
-        "skipped_samples": int(skipped_samples),
+        "skipped_samples": int(skipped_samples),  # NO-PRO=excluidos | PRO=export_type_sample_count (informativo)
         "include_samples": bool(include_samples),
         "jobs": int(jobs),
         "entries": db_entries,
     }
+
+    # ✅ Metadata de “utilizabilidad” (especialmente útil en PRO)
+    if pro:
+        index["export_type_sample_count"] = int(export_type_sample_count)
+        index["export_type_wavetable_count"] = int(export_type_wavetable_count)
 
     # Info extra PRO (útil para tooling y para saber “qué idioma” usa la DB)
     if pro:
@@ -370,6 +430,11 @@ def cmd_index(args) -> int:
         json.dump(index, f, ensure_ascii=False, indent=2)
 
     # Resumen final
+    if pro:
+        skipped_label = f"export_type_sample_count: {skipped_samples} (include_samples={include_samples})"
+    else:
+        skipped_label = f"skipped_samples: {skipped_samples} (include_samples={include_samples})"
+
     print(
         "[index] DONE\n"
         f"  in_dir:          {in_dir}\n"
@@ -377,10 +442,11 @@ def cmd_index(args) -> int:
         f"  processed:       {len(wavs)}\n"
         f"  kept:            {kept}\n"
         f"  failed_files:    {failed_files}\n"
-        f"  skipped_samples: {skipped_samples} (include_samples={include_samples})\n"
+        f"  {skipped_label}\n"
         f"  params:          tableSize={int(table_size)} harmonics={int(args.harmonics)} bands={int(args.bands)} feature_sr={int(core.FEATURE_SR)}\n"
         f"  pro:             {pro}\n"
         + (f"  pro_format:       2048x64 PCM16 sr_out={core.PRO_SR} (WAV+JSON en out_dir)\n" if pro else "")
+        + (f"  export_type_wavetable_count: {export_type_wavetable_count}\n" if pro else "")
         + f"  jobs:            {jobs}"
     )
     return 0
