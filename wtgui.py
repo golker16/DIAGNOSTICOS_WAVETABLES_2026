@@ -337,7 +337,6 @@ class App(tk.Tk):
 
         ui_handler = TkTextHandler(self.log_queue)
         ui_handler.setFormatter(fmt)
-        # (no fijamos nivel del handler -> hereda DEBUG del logger)
         self.logger.addHandler(ui_handler)
 
     def _ensure_file_logger(self, out_dir: Path):
@@ -541,7 +540,6 @@ class App(tk.Tk):
                 bands=int(bands),
                 # PRO fijo:
                 pro=True,
-                # NO pro_wav_dir (ya no existe)
             )
 
             # ✅ CAMBIO: capturar print() del motor
@@ -550,7 +548,7 @@ class App(tk.Tk):
             if self.cancel_requested:
                 self.logger.warning("Index terminó, pero hubo CANCEL REQUESTED (no se pudo interrumpir a mitad).")
 
-            # ✅ NUEVO: resumen real de outputs en carpeta
+            # ✅ resumen real de outputs en carpeta
             try:
                 jsons = list(out_p.glob("*.json"))
                 wavs = list(out_p.glob("*.wav"))
@@ -558,18 +556,34 @@ class App(tk.Tk):
             except Exception as e:
                 self.logger.debug(f"No pude contar outputs: {type(e).__name__}: {e}")
 
-            # ✅ NUEVO (opcional): leer _INDEX.json y reportar kept/failed/skipped
+            # ✅ Ajuste (FORZAR UTILIZABLE): leer _INDEX.json y loguear contadores nuevos si existen
             try:
                 idx_path = out_p / "_INDEX.json"
                 if idx_path.exists():
-                    import json as _json_stdlib
+                    import json as _json_stdlib  # stdlib
                     with open(idx_path, "r", encoding="utf-8") as f:
                         idx = _json_stdlib.load(f)
+
+                    # básicos
+                    kept = idx.get("kept")
+                    failed = idx.get("failed_files")
+                    skipped = idx.get("skipped_samples")
+                    processed = idx.get("processed")
+                    count = idx.get("count")
+
                     self.logger.info(
                         "INDEX summary: "
-                        f"kept={idx.get('kept')} failed_files={idx.get('failed_files')} "
-                        f"skipped_samples={idx.get('skipped_samples')} processed={idx.get('processed')}"
+                        f"count={count} kept={kept} failed_files={failed} skipped_samples={skipped} processed={processed}"
                     )
+
+                    # nuevos (si están)
+                    exp_s = idx.get("export_type_sample_count", None)
+                    exp_w = idx.get("export_type_wavetable_count", None)
+                    if exp_s is not None or exp_w is not None:
+                        self.logger.info(
+                            "INDEX export-type breakdown: "
+                            f"export_type_sample_count={exp_s} export_type_wavetable_count={exp_w}"
+                        )
             except Exception as e:
                 self.logger.debug(f"No pude leer _INDEX.json: {type(e).__name__}: {e}")
 
